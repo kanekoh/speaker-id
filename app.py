@@ -1,7 +1,8 @@
-import os
-from flask import Flask, request, jsonify, send_from_directory, abort
+# speaker_id/app.py
+from flask import Flask, request, jsonify, send_from_directory
 from resemblyzer import preprocess_wav, VoiceEncoder
 import numpy as np
+import os
 import json
 import soundfile as sf
 from io import BytesIO
@@ -17,20 +18,6 @@ log = logging.info  # ショートカット用
 
 app = Flask(__name__)
 encoder = VoiceEncoder()
-
-# 認証トークン
-API_TOKEN = os.environ.get("SPEAKERID_API_KEY", "changeme")
-
-def check_auth():
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return False
-    token = auth.split(" ", 1)[1]
-    return token == API_TOKEN
-
-def require_auth():
-    if not check_auth():
-        abort(401, description="Unauthorized")
 
 # ディレクトリの初期化
 PROFILE_DIR = "profiles"
@@ -54,22 +41,14 @@ for filename in os.listdir(PROFILE_DIR):
 
 @app.route("/")
 def index():
-    require_auth()
     return send_from_directory(".", "index.html")
 
 @app.route("/test.html")
 def test():
-    require_auth()
     return send_from_directory(".", "test.html")
-
-@app.route("/check_token", methods=["GET"])
-def check_token_endpoint():
-    require_auth()
-    return jsonify({"ok": True})
 
 @app.route("/register", methods=["POST"])
 def register():
-    require_auth()
     start_time = time.time()  # 開始時間
 
     if "audio" not in request.files or "name" not in request.form:
@@ -106,7 +85,6 @@ def register():
 
 @app.route("/identify", methods=["POST"])
 def identify():
-    require_auth()
     start_time = time.time()
     log("[identify] request received")
 
@@ -123,4 +101,36 @@ def identify():
         t0 = time.time()
         wav_np, sr = sf.read(BytesIO(audio_bytes))         # ✅ この行が必要！
         wav = preprocess_wav(wav_np, source_sr=sr)         # ✅ NumPy配列＋SRを渡す
-        log(f"[i]()
+        log(f"[identify] preprocess_wav took {time.time() - t0:.3f} sec")
+
+        t0 = time.time()
+        embedding = encoder.embed_utterance(wav)
+        log(f"[identify] embed_utterance took {time.time() - t0:.3f} sec")
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()  # ← 追加すると詳細な例外ログが出ます
+        return jsonify({"error": str(e)}), 500
+
+    best_name = None
+    best_score = -1
+
+    t0 = time.time()
+    for name, prof_embedding in profiles.items():
+        score = float(np.dot(embedding, prof_embedding))
+        if score > best_score:
+            best_score = score
+            best_name = name
+    log(f"[identify] similarity search took {time.time() - t0:.3f} sec")
+
+    kana = metadata.get(best_name, {}).get("kana", best_name)
+
+    log(f"[identify] Total time: {time.time() - start_time:.3f} sec")
+    return jsonify({
+        "name": best_name,
+        "kana": kana,
+        "score": round(best_score, 3)
+    })
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8000, debug=True)
