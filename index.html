@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>話者登録</title>
+  <style>
+    body { font-family: sans-serif; padding: 2em; background: #f2f2f2; }
+    h1 { color: #333; }
+    label, input, button { display: block; margin: 1em 0; }
+    #status { margin-top: 1em; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>話者登録</h1>
+
+  <label for="nameInput">識別名（半角英数字）:</label>
+  <input type="text" id="nameInput" placeholder="例: tanaka">
+
+  <label for="kanaInput">表示名（ひらがなや漢字など）:</label>
+  <input type="text" id="kanaInput" placeholder="例: たなかさん">
+
+  <button id="recordButton">🎙️ 録音開始</button>
+
+  <p>以下の文を読み上げてください：</p>
+  <p id="sampleText">こんにちは。私は〇〇です。スタックチャンに声を登録します。よろしくお願いします。</p>
+
+
+  <button id="stopButton" disabled>⏹️ 録音終了</button>
+  <button id="uploadButton" disabled>⬆️ 登録して送信</button>
+
+  <p id="status">状態: 待機中</p>
+
+  <a href="/test.html">→ 話者識別テストへ</a>
+
+  <script>
+    let mediaRecorder;
+    let recordedChunks = [];
+
+    const recordBtn = document.getElementById("recordButton");
+    const stopBtn = document.getElementById("stopButton");
+    const uploadBtn = document.getElementById("uploadButton");
+    const status = document.getElementById("status");
+
+    function updateSampleText() {
+      const name = kanaInput.value.trim();
+      if (name) {
+        sampleText.textContent = `こんにちは。私は${name}です。スタックチャンに声を登録します。よろしくお願いします。`;
+      } else {
+        sampleText.textContent = `こんにちは。私は〇〇です。スタックチャンに声を登録します。よろしくお願いします。`;
+      }
+    }
+
+    recordBtn.onclick = async () => {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaRecorder = new MediaRecorder(stream);
+      recordedChunks = [];
+
+      mediaRecorder.ondataavailable = e => recordedChunks.push(e.data);
+      mediaRecorder.onstop = () => {
+        status.textContent = "録音終了";
+        uploadBtn.disabled = false;
+      };
+
+      mediaRecorder.start();
+      status.textContent = "録音中...";
+      recordBtn.disabled = true;
+      stopBtn.disabled = false;
+    };
+
+    stopBtn.onclick = () => {
+      mediaRecorder.stop();
+      recordBtn.disabled = false;
+      stopBtn.disabled = true;
+    };
+
+    uploadBtn.onclick = async () => {
+      const name = document.getElementById("nameInput").value.trim();
+      const kana = document.getElementById("kanaInput").value.trim();
+
+      if (!name) {
+        alert("識別名を入力してください");
+        return;
+      }
+
+      document.getElementById("nameInput").addEventListener("input", e => {
+        const name = e.target.value || "〇〇";
+        document.getElementById("exampleSentence").textContent =
+          `こんにちは。わたしの名前は${name}です。よろしくお願いします。`;
+      });
+
+
+      const blob = new Blob(recordedChunks, { type: 'audio/wav' });
+      const formData = new FormData();
+      formData.append("audio", blob, name + ".wav");
+      formData.append("name", name);
+      formData.append("kana", kana);
+
+      status.textContent = "送信中...";
+      try {
+        const res = await fetch("/register", {
+          method: "POST",
+          body: formData
+        });
+        const result = await res.json();
+        status.textContent = `登録成功: ${result.kana}（ID: ${result.name}）`;
+      } catch (e) {
+        console.error(e);
+        status.textContent = "エラー発生";
+      }
+    };
+  </script>
+</body>
+</html>

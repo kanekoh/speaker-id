@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>話者確認テスト</title>
+  <style>
+    body { font-family: sans-serif; padding: 2em; background: #eef; }
+    h1 { color: #333; }
+    button { margin: 1em 0; }
+    #result { font-weight: bold; margin-top: 1em; }
+  </style>
+</head>
+<body>
+  <h1>話者識別テスト</h1>
+
+  <button id="recordBtn">🎙️ 録音開始</button>
+  <button id="stopBtn" disabled>⏹️ 録音終了</button>
+  <button id="identifyBtn" disabled>🔍 確認</button>
+
+  <p id="result">状態: 待機中</p>
+  <a href="/">→ 話者登録画面へ戻る</a>
+
+  <script>
+    let mediaRecorder;
+    let recordedChunks = [];
+
+    const recordBtn = document.getElementById("recordBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const identifyBtn = document.getElementById("identifyBtn");
+    const result = document.getElementById("result");
+
+    recordBtn.onclick = async () => {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      mediaRecorder = new MediaRecorder(stream);
+      recordedChunks = [];
+
+      mediaRecorder.ondataavailable = e => recordedChunks.push(e.data);
+      mediaRecorder.onstop = () => {
+        result.textContent = "録音完了";
+        identifyBtn.disabled = false;
+      };
+
+      mediaRecorder.start();
+      result.textContent = "録音中...";
+      recordBtn.disabled = true;
+      stopBtn.disabled = false;
+    };
+
+    stopBtn.onclick = () => {
+      mediaRecorder.stop();
+      recordBtn.disabled = false;
+      stopBtn.disabled = true;
+    };
+
+    identifyBtn.onclick = async () => {
+      const blob = new Blob(recordedChunks, { type: 'audio/wav' });
+      const formData = new FormData();
+      formData.append("audio", blob, "test.wav");
+
+      result.textContent = "識別中...";
+
+      try {
+        const res = await fetch("/identify", {
+          method: "POST",
+          body: formData
+        });
+        const data = await res.json();
+        if (data.name) {
+          result.textContent = `認識された人: ${data.kana}（スコア: ${data.score}）`;
+        } else {
+          result.textContent = `識別できませんでした`;
+        }
+      } catch (e) {
+        console.error(e);
+        result.textContent = "エラーが発生しました";
+      }
+    };
+  </script>
+</body>
+</html>
