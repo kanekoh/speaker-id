@@ -1,13 +1,15 @@
-# speaker_id/app.py
-from flask import Flask, request, jsonify, send_from_directory
+import os
+from flask import Flask, request, jsonify, send_from_directory, abort, send_file
 from resemblyzer import preprocess_wav, VoiceEncoder
 import numpy as np
-import os
 import json
 import soundfile as sf
 from io import BytesIO
 import time
 import logging
+import zipfile
+import io
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -18,6 +20,31 @@ log = logging.info  # ショートカット用
 
 app = Flask(__name__)
 encoder = VoiceEncoder()
+
+# 認証トークン
+# --- APIトークン取得と存在チェック ---
+API_TOKEN = os.environ.get("SPEAKERID_API_KEY")
+if not API_TOKEN:
+    raise RuntimeError(
+        "環境変数 SPEAKERID_API_KEY が設定されていません。"
+        "Render等の環境変数に必ずセットしてください！"
+    )
+print(f"SPEAKERID_API_KEY loaded: {API_TOKEN[:6]}...（{len(API_TOKEN)}文字）")
+
+
+def check_auth():
+    auth = request.headers.get("Authorization", "")
+    print(f"[DEBUG] Authorizationヘッダー: {auth!r}")  # デバッグ時だけ
+    if not auth.startswith("Bearer "):
+        return False
+    token = auth.split(" ", 1)[1]
+    print(f"[DEBUG] 受信トークン: {token[:6]}...（{len(token)}文字）")  # マスク
+    print(f"[DEBUG] サーバートークン: {API_TOKEN[:6]}...（{len(API_TOKEN)}文字）")
+    return token == API_TOKEN
+
+def require_auth():
+    if not check_auth():
+        abort(401, description="Unauthorized")
 
 # ディレクトリの初期化
 PROFILE_DIR = "profiles"
@@ -47,8 +74,54 @@ def index():
 def test():
     return send_from_directory(".", "test.html")
 
+@app.route("/check_token", methods=["GET"])
+def check_token_endpoint():
+    require_auth()
+    return jsonify({"ok": True})
+
+@app.route("/backup", methods=["GET"])
+def backup():
+    require_auth()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(PROFILE_DIR):
+            for file in files:
+                filepath = os.path.join(root, file)
+                arcname = os.path.relpath(filepath, PROFILE_DIR)
+                zf.write(filepath, arcname)
+    buf.seek(0)
+    return send_file(
+        buf, mimetype="application/zip",
+        as_attachment=True, download_name="profiles_backup.zip"
+    )
+
+@app.route("/restore", methods=["POST"])
+def restore():
+    require_auth()
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded."}), 400
+    file = request.files["file"]
+    buf = io.BytesIO(file.read())
+    with zipfile.ZipFile(buf) as zf:
+        zf.extractall(PROFILE_DIR)
+    # リストア後、グローバル変数を再読み込みする（重要！）
+    global metadata, profiles
+    if os.path.exists(META_FILE):
+        with open(META_FILE, "r") as f:
+            metadata = json.load(f)
+    else:
+        metadata = {}
+    profiles = {}
+    for filename in os.listdir(PROFILE_DIR):
+        if filename.endswith(".wav"):
+            name = filename.rsplit(".", 1)[0]
+            wav = preprocess_wav(os.path.join(PROFILE_DIR, filename))
+            profiles[name] = encoder.embed_utterance(wav)
+    return jsonify({"status": "restored"})
+
 @app.route("/register", methods=["POST"])
 def register():
+    require_auth()
     start_time = time.time()  # 開始時間
 
     if "audio" not in request.files or "name" not in request.form:
@@ -85,6 +158,7 @@ def register():
 
 @app.route("/identify", methods=["POST"])
 def identify():
+    require_auth()
     start_time = time.time()
     log("[identify] request received")
 

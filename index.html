@@ -24,7 +24,6 @@
   <p>以下の文を読み上げてください：</p>
   <p id="sampleText">こんにちは。私は〇〇です。スタックチャンに声を登録します。よろしくお願いします。</p>
 
-
   <button id="stopButton" disabled>⏹️ 録音終了</button>
   <button id="uploadButton" disabled>⬆️ 登録して送信</button>
 
@@ -32,23 +31,30 @@
 
   <a href="/test.html">→ 話者識別テストへ</a>
 
+  <!-- どこか分かりやすい場所に設置 -->
+  <button id="logoutBtn">ログアウト</button>
+
+  <script src="/static/auth.js"></script>
   <script>
     let mediaRecorder;
     let recordedChunks = [];
 
+
+    // --- 録音・送信のロジック（認証ヘッダー付きで送信） ---
     const recordBtn = document.getElementById("recordButton");
     const stopBtn = document.getElementById("stopButton");
     const uploadBtn = document.getElementById("uploadButton");
     const status = document.getElementById("status");
 
-    function updateSampleText() {
-      const name = kanaInput.value.trim();
-      if (name) {
-        sampleText.textContent = `こんにちは。私は${name}です。スタックチャンに声を登録します。よろしくお願いします。`;
-      } else {
-        sampleText.textContent = `こんにちは。私は〇〇です。スタックチャンに声を登録します。よろしくお願いします。`;
-      }
-    }
+    // --- 認証（auth.js） ---
+    window.onload = function () {
+      Auth.ensureToken();
+    };
+
+    document.getElementById("logoutBtn").onclick = function() {
+      Auth.logout();
+      // location.reload(); // 必要に応じて有効化
+    };
 
     recordBtn.onclick = async () => {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -82,13 +88,6 @@
         return;
       }
 
-      document.getElementById("nameInput").addEventListener("input", e => {
-        const name = e.target.value || "〇〇";
-        document.getElementById("exampleSentence").textContent =
-          `こんにちは。わたしの名前は${name}です。よろしくお願いします。`;
-      });
-
-
       const blob = new Blob(recordedChunks, { type: 'audio/wav' });
       const formData = new FormData();
       formData.append("audio", blob, name + ".wav");
@@ -97,12 +96,16 @@
 
       status.textContent = "送信中...";
       try {
-        const res = await fetch("/register", {
+        const res = await Auth.authFetch("/register", {
           method: "POST",
           body: formData
         });
         const result = await res.json();
-        status.textContent = `登録成功: ${result.kana}（ID: ${result.name}）`;
+        if (res.ok) {
+          status.textContent = `登録成功: ${result.kana}（ID: ${result.name}）`;
+        } else {
+          status.textContent = "認証エラーまたは登録失敗";
+        }
       } catch (e) {
         console.error(e);
         status.textContent = "エラー発生";

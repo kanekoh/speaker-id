@@ -19,7 +19,10 @@
 
   <p id="result">状態: 待機中</p>
   <a href="/">→ 話者登録画面へ戻る</a>
+  <!-- どこか分かりやすい場所に設置 -->
+  <button id="logoutBtn">ログアウト</button>
 
+  <script src="/static/auth.js"></script>
   <script>
     let mediaRecorder;
     let recordedChunks = [];
@@ -28,6 +31,16 @@
     const stopBtn = document.getElementById("stopBtn");
     const identifyBtn = document.getElementById("identifyBtn");
     const result = document.getElementById("result");
+
+        // ページ初回認証
+    window.onload = function() {
+      Auth.ensureToken();
+    };
+
+    document.getElementById("logoutBtn").onclick = function() {
+      Auth.logout();
+      // location.reload(); // 必要に応じて有効化
+    };
 
     recordBtn.onclick = async () => {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -60,7 +73,7 @@
       result.textContent = "識別中...";
 
       try {
-        const res = await fetch("/identify", {
+        const res = await Auth.authFetch("/identify", {
           method: "POST",
           body: formData
         });
