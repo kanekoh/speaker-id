@@ -1,22 +1,24 @@
-FROM python:3.10-slim
+FROM python:3.12-slim
 
-# システム依存パッケージのみインストール
+WORKDIR /app
+
+# sherpa-onnx モデルのURL（ビルド時に上書き可能）
+# モデル一覧: https://github.com/k2-fsa/sherpa-onnx/releases/tag/speaker-recog-models
+ARG SPEAKER_MODEL_URL=https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx
+
 RUN apt-get update && apt-get install -y \
-    gcc \
-    ffmpeg \
+    wget \
     libsndfile1 \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir torch==2.3.0+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html
-
-# 依存関係ファイルを先にコピー（キャッシュ利用効率化）
-COPY requirements.txt /app/
-WORKDIR /app
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# コード・必要なファイルだけコピー
+# 話者識別モデルをダウンロード
+RUN mkdir -p /app/model && \
+    wget -q -O /app/model/model.onnx "${SPEAKER_MODEL_URL}"
+
 COPY . /app
 
 CMD ["python", "-u", "app.py"]
-

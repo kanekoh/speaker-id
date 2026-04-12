@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# pytest
+.pytest_cache/
+
+# Claude Code
+.claude/
+
+# Runtime data (user profiles / audio)
+profiles/
+
+# Logs / temp files
+*.log
+*.tmp

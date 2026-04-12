@@ -1,7 +1,8 @@
 import os
 from flask import Flask, request, jsonify, send_from_directory, abort, send_file
-from resemblyzer import preprocess_wav, VoiceEncoder
+import sherpa_onnx
 import numpy as np
+from scipy import signal as scipy_signal
 import json
 import soundfile as sf
 from io import BytesIO
@@ -19,10 +20,18 @@ logging.basicConfig(
 log = logging.info  # ショートカット用
 
 app = Flask(__name__)
-encoder = VoiceEncoder()
+
+# 話者識別モデルの初期化
+MODEL_PATH = os.getenv("SPEAKER_MODEL_PATH", "/app/model/model.onnx")
+SAMPLE_RATE = 16000
+
+extractor_config = sherpa_onnx.SpeakerEmbeddingExtractorConfig(
+    model=MODEL_PATH,
+    num_threads=2,
+)
+extractor = sherpa_onnx.SpeakerEmbeddingExtractor(extractor_config)
 
 # 認証トークン
-# --- APIトークン取得と存在チェック ---
 API_TOKEN = os.environ.get("SPEAKERID_API_KEY")
 if not API_TOKEN:
     raise RuntimeError(
@@ -34,17 +43,34 @@ print(f"SPEAKERID_API_KEY loaded: {API_TOKEN[:6]}...（{len(API_TOKEN)}文字）
 
 def check_auth():
     auth = request.headers.get("Authorization", "")
-    print(f"[DEBUG] Authorizationヘッダー: {auth!r}")  # デバッグ時だけ
     if not auth.startswith("Bearer "):
         return False
     token = auth.split(" ", 1)[1]
-    print(f"[DEBUG] 受信トークン: {token[:6]}...（{len(token)}文字）")  # マスク
-    print(f"[DEBUG] サーバートークン: {API_TOKEN[:6]}...（{len(API_TOKEN)}文字）")
     return token == API_TOKEN
 
 def require_auth():
     if not check_auth():
         abort(401, description="Unauthorized")
+
+def get_embedding_from_array(audio: np.ndarray, sr: int) -> np.ndarray:
+    """音声配列から話者埋め込みベクトルを抽出する"""
+    # モノラル化
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    # 16kHz にリサンプリング
+    if sr != SAMPLE_RATE:
+        num_samples = int(len(audio) * SAMPLE_RATE / sr)
+        audio = scipy_signal.resample(audio, num_samples)
+    audio = audio.astype(np.float32)
+    stream = extractor.create_stream()
+    stream.accept_waveform(SAMPLE_RATE, audio)
+    stream.input_finished()
+    return np.array(extractor.compute(stream))
+
+def get_embedding_from_file(filepath: str) -> np.ndarray:
+    """WAVファイルから話者埋め込みベクトルを抽出する"""
+    audio, sr = sf.read(filepath, dtype='float32')
+    return get_embedding_from_array(audio, sr)
 
 # ディレクトリの初期化
 PROFILE_DIR = "profiles"
@@ -63,8 +89,10 @@ profiles = {}
 for filename in os.listdir(PROFILE_DIR):
     if filename.endswith(".wav"):
         name = filename.rsplit(".", 1)[0]
-        wav = preprocess_wav(os.path.join(PROFILE_DIR, filename))
-        profiles[name] = encoder.embed_utterance(wav)
+        try:
+            profiles[name] = get_embedding_from_file(os.path.join(PROFILE_DIR, filename))
+        except Exception as e:
+            logging.warning(f"[startup] Failed to load profile '{filename}': {e}")
 
 @app.route("/")
 def index():
@@ -104,7 +132,6 @@ def restore():
     buf = io.BytesIO(file.read())
     with zipfile.ZipFile(buf) as zf:
         zf.extractall(PROFILE_DIR)
-    # リストア後、グローバル変数を再読み込みする（重要！）
     global metadata, profiles
     if os.path.exists(META_FILE):
         with open(META_FILE, "r") as f:
@@ -115,14 +142,13 @@ def restore():
     for filename in os.listdir(PROFILE_DIR):
         if filename.endswith(".wav"):
             name = filename.rsplit(".", 1)[0]
-            wav = preprocess_wav(os.path.join(PROFILE_DIR, filename))
-            profiles[name] = encoder.embed_utterance(wav)
+            profiles[name] = get_embedding_from_file(os.path.join(PROFILE_DIR, filename))
     return jsonify({"status": "restored"})
 
 @app.route("/register", methods=["POST"])
 def register():
     require_auth()
-    start_time = time.time()  # 開始時間
+    start_time = time.time()
 
     if "audio" not in request.files or "name" not in request.form:
         return jsonify({"error": "audio and name are required"}), 400
@@ -139,13 +165,8 @@ def register():
 
     try:
         t0 = time.time()
-        wav = preprocess_wav(save_path)
-        print(f"[register] preprocess_wav took {time.time() - t0:.3f} sec")
-
-        t0 = time.time()
-        profiles[name] = encoder.embed_utterance(wav)
-        print(f"[register] embed_utterance took {time.time() - t0:.3f} sec")
-
+        profiles[name] = get_embedding_from_file(save_path)
+        print(f"[register] get_embedding took {time.time() - t0:.3f} sec")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -165,25 +186,17 @@ def identify():
     if "audio" not in request.files:
         return jsonify({"error": "No audio file provided."}), 400
 
-    log("[identify] request.files読み込み開始")
     file = request.files["audio"]
-    log("[identify] request.files読み込み完了")
     audio_bytes = file.read()
-    log("[identify] file.read() 完了")
 
     try:
         t0 = time.time()
-        wav_np, sr = sf.read(BytesIO(audio_bytes))         # ✅ この行が必要！
-        wav = preprocess_wav(wav_np, source_sr=sr)         # ✅ NumPy配列＋SRを渡す
-        log(f"[identify] preprocess_wav took {time.time() - t0:.3f} sec")
-
-        t0 = time.time()
-        embedding = encoder.embed_utterance(wav)
-        log(f"[identify] embed_utterance took {time.time() - t0:.3f} sec")
-
+        audio, sr = sf.read(BytesIO(audio_bytes), dtype='float32')
+        embedding = get_embedding_from_array(audio, sr)
+        log(f"[identify] get_embedding took {time.time() - t0:.3f} sec")
     except Exception as e:
         import traceback
-        traceback.print_exc()  # ← 追加すると詳細な例外ログが出ます
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
     best_name = None
@@ -207,4 +220,4 @@ def identify():
     })
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8443, debug=True, ssl_context=("/certs/cert.pem", "/certs/key.pem"))
+    app.run(host="0.0.0.0", port=8080, debug=False)
