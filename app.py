@@ -85,15 +85,28 @@ if os.path.exists(META_FILE):
 else:
     metadata = {}
 
-# 音声埋め込み読み込み
+# 音声埋め込み読み込み（壊れたファイルはpydubで修復してから読む）
 profiles = {}
 for filename in os.listdir(PROFILE_DIR):
     if filename.endswith(".wav"):
+        filepath = os.path.join(PROFILE_DIR, filename)
         name = filename.rsplit(".", 1)[0]
         try:
-            profiles[name] = get_embedding_from_file(os.path.join(PROFILE_DIR, filename))
+            profiles[name] = get_embedding_from_file(filepath)
         except Exception as e:
-            logging.warning(f"[startup] Failed to load profile '{filename}': {e}")
+            logging.warning(f"[startup] Failed to load profile '{filename}': {e} — attempting conversion")
+            try:
+                audio_seg = AudioSegment.from_file(filepath)
+                audio_seg.export(filepath, format="wav")
+                profiles[name] = get_embedding_from_file(filepath)
+                logging.info(f"[startup] Converted and loaded '{filename}' successfully")
+            except Exception as e2:
+                logging.error(f"[startup] Could not recover '{filename}': {e2}")
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    logging.exception(f"[unhandled] {e}")
+    return jsonify({"error": str(e)}), 500
 
 @app.route("/")
 def index():
@@ -176,6 +189,7 @@ def register():
         profiles[name] = get_embedding_from_file(save_path)
         print(f"[register] get_embedding took {time.time() - t0:.3f} sec")
     except Exception as e:
+        logging.exception("[register] get_embedding failed")
         return jsonify({"error": str(e)}), 500
 
     metadata[name] = {"kana": kana}
