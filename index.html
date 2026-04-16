@@ -57,7 +57,17 @@
     };
 
     recordBtn.onclick = async () => {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        status.textContent = "エラー: マイクAPIが使用できません（HTTPSまたはlocalhostが必要です）";
+        return;
+      }
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (e) {
+        status.textContent = `エラー: マイクへのアクセス失敗 - ${e.name}: ${e.message}`;
+        return;
+      }
       mediaRecorder = new MediaRecorder(stream);
       recordedChunks = [];
 
@@ -104,11 +114,11 @@
         if (res.ok) {
           status.textContent = `登録成功: ${result.kana}（ID: ${result.name}）`;
         } else {
-          status.textContent = "認証エラーまたは登録失敗";
+          status.textContent = `エラー (HTTP ${res.status}): ${result.error || JSON.stringify(result)}`;
         }
       } catch (e) {
         console.error(e);
-        status.textContent = "エラー発生";
+        status.textContent = `エラー発生: ${e.message}`;
       }
     };
   </script>

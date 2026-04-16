@@ -10,6 +10,7 @@ import time
 import logging
 import zipfile
 import io
+from pydub import AudioSegment
 
 
 logging.basicConfig(
@@ -161,7 +162,14 @@ def register():
         return jsonify({"error": "Name is empty"}), 400
 
     save_path = os.path.join(PROFILE_DIR, f"{name}.wav")
-    file.save(save_path)
+
+    try:
+        raw_bytes = file.read()
+        audio_seg = AudioSegment.from_file(io.BytesIO(raw_bytes))
+        audio_seg.export(save_path, format="wav")
+    except Exception as e:
+        logging.exception("[register] audio conversion failed")
+        return jsonify({"error": f"音声変換失敗: {e}"}), 500
 
     try:
         t0 = time.time()

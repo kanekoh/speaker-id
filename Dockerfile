@@ -9,6 +9,7 @@ ARG SPEAKER_MODEL_URL=https://github.com/k2-fsa/sherpa-onnx/releases/download/sp
 RUN apt-get update && apt-get install -y \
     wget \
     libsndfile1 \
+    ffmpeg \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
 
