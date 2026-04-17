@@ -5,9 +5,9 @@ import numpy as np
 from scipy import signal as scipy_signal
 import json
 import soundfile as sf
-from io import BytesIO
 import time
 import logging
+import sys
 import zipfile
 import io
 from pydub import AudioSegment
@@ -16,11 +16,15 @@ from pydub import AudioSegment
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+    force=True,
 )
 log = logging.info  # ショートカット用
 
 app = Flask(__name__)
+app.logger.handlers = []
+app.logger.propagate = True
 
 # 話者識別モデルの初期化
 MODEL_PATH = os.getenv("SPEAKER_MODEL_PATH", "/app/model/model.onnx")
@@ -52,6 +56,15 @@ def check_auth():
 def require_auth():
     if not check_auth():
         abort(401, description="Unauthorized")
+
+def get_embedding_from_bytes(audio_bytes: bytes) -> np.ndarray:
+    """任意フォーマット（webm/ogg/wav等）の音声バイト列から話者埋め込みベクトルを抽出する"""
+    audio_seg = AudioSegment.from_file(io.BytesIO(audio_bytes))
+    wav_buf = io.BytesIO()
+    audio_seg.export(wav_buf, format="wav")
+    wav_buf.seek(0)
+    audio, sr = sf.read(wav_buf, dtype='float32')
+    return get_embedding_from_array(audio, sr)
 
 def get_embedding_from_array(audio: np.ndarray, sr: int) -> np.ndarray:
     """音声配列から話者埋め込みベクトルを抽出する"""
@@ -216,12 +229,10 @@ def identify():
 
     try:
         t0 = time.time()
-        audio, sr = sf.read(BytesIO(audio_bytes), dtype='float32')
-        embedding = get_embedding_from_array(audio, sr)
+        embedding = get_embedding_from_bytes(audio_bytes)
         log(f"[identify] get_embedding took {time.time() - t0:.3f} sec")
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        logging.exception("[identify] get_embedding failed")
         return jsonify({"error": str(e)}), 500
 
     best_name = None
