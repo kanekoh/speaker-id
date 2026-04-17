@@ -105,6 +105,7 @@ for filename in os.listdir(PROFILE_DIR):
 
 @app.errorhandler(Exception)
 def handle_exception(e):
+    print(f"[unhandled exception] {type(e).__name__}: {e}", flush=True)
     logging.exception(f"[unhandled] {e}")
     return jsonify({"error": str(e)}), 500
 
@@ -161,7 +162,9 @@ def restore():
 
 @app.route("/register", methods=["POST"])
 def register():
+    print("[register] ---- request received ----", flush=True)
     require_auth()
+    print("[register] auth passed", flush=True)
     start_time = time.time()
 
     if "audio" not in request.files or "name" not in request.form:
