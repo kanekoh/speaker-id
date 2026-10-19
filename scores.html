@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>識別スコア</title>
+  <link rel="stylesheet" href="/static/score-charts.css">
+  <style>
+    body { font-family: sans-serif; padding: 2em; background: #eef; max-width: 1100px; margin: 0 auto; }
+    @media (prefers-color-scheme: dark) { body { background: #111110; color: #f0efec; } a { color: #8ab4f8; } }
+    @media (max-width: 600px) { body { padding: 1em 16px; } }
+    h1 { font-size: 1.4em; }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .toolbar label { font-size: 0.9em; }
+  </style>
+</head>
+<body>
+  <h1>識別スコア</h1>
+
+  <div class="toolbar">
+    <button id="reloadBtn">🔄 再読み込み</button>
+    <label><input type="checkbox" id="autoReload" checked> 5秒ごとに自動更新</label>
+    <button id="clearBtn">🗑️ ログを消去</button>
+    <a href="/test.html">→ 話者識別テストへ</a>
+    <a href="/">→ 話者登録へ</a>
+  </div>
+
+  <section class="viz-root">
+    <h2>最新の識別結果</h2>
+    <p class="viz-sub" id="latestSub"></p>
+    <div id="latestChart"></div>
+  </section>
+
+  <section class="viz-root">
+    <h2>人ごとのスコア推移</h2>
+    <p class="viz-sub">直近50回の識別で、その人の登録音声とどれだけ似ていたか（コサイン類似度）。右ほど新しい。</p>
+    <div id="multiples"></div>
+  </section>
+
+  <section class="viz-root">
+    <h2>ログ</h2>
+    <p class="viz-sub">サーバーのメモリ上に直近の記録だけを保持しています（再起動で消えます）。</p>
+    <div id="logTable"></div>
+  </section>
+
+  <script src="/static/auth.js"></script>
+  <script src="/static/score-charts.js"></script>
+  <script>
+    const latestSub = document.getElementById("latestSub");
+    let timer;
+
+    async function load() {
+      const res = await Auth.authFetch("/identify_log");
+      if (!res.ok) return;
+      const data = await res.json();
+
+      const last = data.entries[data.entries.length - 1];
+      if (last) {
+        const kana = Object.fromEntries(data.people.map((p) => [p.name, p.kana]));
+        const scores = Object.entries(last.scores)
+          .map(([name, score]) => ({ name, kana: kana[name] || name, score }))
+          .sort((a, b) => b.score - a.score);
+        latestSub.textContent = `${last.time.replace("T", " ")}（${last.source}）: `
+          + (last.result ? `✓ ${last.result} と判定` : "✗ 該当なし")
+          + `　閾値 ${data.threshold}`;
+        ScoreCharts.renderBars(document.getElementById("latestChart"), scores, data.threshold);
+      } else {
+        latestSub.textContent = "まだ識別の記録がありません";
+        document.getElementById("latestChart").replaceChildren();
+      }
+      ScoreCharts.renderMultiples(document.getElementById("multiples"), data);
+      ScoreCharts.renderTable(document.getElementById("logTable"), data);
+    }
+
+    function setAutoReload(on) {
+      clearInterval(timer);
+      if (on) timer = setInterval(load, 5000);
+    }
+
+    window.onload = function () {
+      Auth.ensureToken(() => { load(); setAutoReload(true); });
+    };
+    document.getElementById("reloadBtn").onclick = load;
+    window.addEventListener("resize", () => { clearTimeout(window._rt); window._rt = setTimeout(load, 300); });
+    document.getElementById("autoReload").onchange = (e) => setAutoReload(e.target.checked);
+    document.getElementById("clearBtn").onclick = async () => {
+      if (!confirm("識別ログを消去しますか？")) return;
+      await Auth.authFetch("/identify_log", { method: "DELETE" });
+      load();
+    };
+  </script>
+</body>
+</html>

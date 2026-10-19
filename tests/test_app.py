@@ -292,6 +292,65 @@ class TestIdentify:
 
 
 # -----------------------------------------------------------------------
+# /identify_log エンドポイントテスト
+# -----------------------------------------------------------------------
+class TestIdentifyLog:
+    def _identify(self, client, source=None):
+        data = {"audio": (_make_wav(), "query.wav", "audio/wav")}
+        if source:
+            data["source"] = source
+        return client.post("/identify", headers=AUTH, data=data,
+                           content_type="multipart/form-data")
+
+    def test_requires_auth(self, client):
+        """GET/DELETE /identify_log は Bearer トークンなしで 401"""
+        assert client.get("/identify_log").status_code == 401
+        assert client.delete("/identify_log").status_code == 401
+
+    def test_identify_returns_all_scores_sorted(self, client, monkeypatch):
+        """/identify は全登録者のスコアを降順で返す"""
+        vec_bob = np.zeros(192, dtype=np.float32)
+        vec_bob[0] = 1.0
+        monkeypatch.setattr(app_module, "profiles", {
+            "alice": np.ones(192, dtype=np.float32) / np.sqrt(192), "bob": vec_bob})
+        monkeypatch.setattr(app_module, "metadata", {"alice": {"kana": "アリス"}})
+
+        data = self._identify(client).get_json()
+        assert [s["name"] for s in data["scores"]] == ["alice", "bob"]
+        assert data["scores"][0]["kana"] == "アリス"
+        assert data["scores"][1]["kana"] == "bob"
+        assert data["threshold"] == app_module.SCORE_THRESHOLD
+
+    def test_identify_is_logged(self, client, monkeypatch):
+        """識別結果が履歴に記録され、GET で取得できる"""
+        monkeypatch.setattr(app_module, "profiles", {"alice": np.ones(192, dtype=np.float32) / np.sqrt(192)})
+        monkeypatch.setattr(app_module, "metadata", {"alice": {"kana": "アリス"}})
+        app_module.identify_log.clear()
+
+        self._identify(client, source="test")
+        resp = client.get("/identify_log", headers=AUTH)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["people"] == [{"name": "alice", "kana": "アリス"}]
+        assert len(data["entries"]) == 1
+        entry = data["entries"][0]
+        assert entry["result"] == "alice"
+        assert entry["source"] == "test"
+        assert set(entry["scores"]) == {"alice"}
+
+    def test_clear_log(self, client, monkeypatch):
+        """DELETE /identify_log で履歴が空になる"""
+        monkeypatch.setattr(app_module, "profiles", {"alice": np.ones(192, dtype=np.float32)})
+        self._identify(client)
+        assert client.delete("/identify_log", headers=AUTH).status_code == 200
+        assert client.get("/identify_log", headers=AUTH).get_json()["entries"] == []
+
+    def test_scores_page_accessible(self, client):
+        """GET /scores.html は認証不要でページが返る"""
+        assert client.get("/scores.html").status_code == 200
+
+
+# -----------------------------------------------------------------------
 # 埋め込み抽出テスト
 # -----------------------------------------------------------------------
 class TestEmbedding:

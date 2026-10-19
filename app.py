@@ -10,6 +10,8 @@ import logging
 import sys
 import zipfile
 import io
+from collections import deque
+from datetime import datetime
 from pydub import AudioSegment
 from werkzeug.exceptions import HTTPException
 
@@ -32,6 +34,9 @@ MODEL_PATH = os.getenv("SPEAKER_MODEL_PATH", "/app/model/model.onnx")
 SAMPLE_RATE = 16000
 # コサイン類似度がこの値未満なら「該当者なし」とする（実データで調整すること）
 SCORE_THRESHOLD = float(os.getenv("SPEAKER_SCORE_THRESHOLD", "0.5"))
+
+# 識別結果の履歴（スコア確認用、メモリ上のみで再起動すると消える）
+identify_log = deque(maxlen=int(os.getenv("IDENTIFY_LOG_SIZE", "200")))
 
 extractor_config = sherpa_onnx.SpeakerEmbeddingExtractorConfig(
     model=MODEL_PATH,
@@ -138,6 +143,10 @@ def index():
 def test():
     return send_from_directory(".", "test.html")
 
+@app.route("/scores.html")
+def scores_page():
+    return send_from_directory(".", "scores.html")
+
 @app.route("/check_token", methods=["GET"])
 def check_token_endpoint():
     require_auth()
@@ -243,34 +252,64 @@ def identify():
         logging.exception("[identify] get_embedding failed")
         return jsonify({"error": str(e)}), 500
 
-    best_name = None
-    best_score = -1
-
     t0 = time.time()
-    for name, prof_embedding in profiles.items():
-        score = float(np.dot(embedding, prof_embedding))
-        if score > best_score:
-            best_score = score
-            best_name = name
+    scores = {name: float(np.dot(embedding, prof_embedding))
+              for name, prof_embedding in profiles.items()}
+    best_name = max(scores, key=scores.get) if scores else None
+    best_score = scores[best_name] if best_name else -1
     log(f"[identify] similarity search took {time.time() - t0:.3f} sec")
+
+    accepted = best_name is not None and best_score >= SCORE_THRESHOLD
+    identify_log.append({
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "source": request.form.get("source", "api"),
+        "result": best_name if accepted else None,
+        "candidate": best_name,
+        "score": round(best_score, 3),
+        "scores": {name: round(score, 3) for name, score in scores.items()},
+    })
+    score_list = [
+        {"name": name, "kana": metadata.get(name, {}).get("kana", name), "score": round(score, 3)}
+        for name, score in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    ]
 
     log(f"[identify] best={best_name} score={best_score:.3f} threshold={SCORE_THRESHOLD}")
     log(f"[identify] Total time: {time.time() - start_time:.3f} sec")
 
-    if best_name is None or best_score < SCORE_THRESHOLD:
+    if not accepted:
         return jsonify({
             "name": None,
             "kana": None,
             "score": round(best_score, 3),
             "candidate": best_name,
+            "threshold": SCORE_THRESHOLD,
+            "scores": score_list,
         })
 
     kana = metadata.get(best_name, {}).get("kana", best_name)
     return jsonify({
         "name": best_name,
         "kana": kana,
-        "score": round(best_score, 3)
+        "score": round(best_score, 3),
+        "threshold": SCORE_THRESHOLD,
+        "scores": score_list,
     })
+
+@app.route("/identify_log", methods=["GET"])
+def get_identify_log():
+    require_auth()
+    return jsonify({
+        "threshold": SCORE_THRESHOLD,
+        "people": [{"name": name, "kana": metadata.get(name, {}).get("kana", name)}
+                   for name in sorted(profiles)],
+        "entries": list(identify_log),
+    })
+
+@app.route("/identify_log", methods=["DELETE"])
+def clear_identify_log():
+    require_auth()
+    identify_log.clear()
+    return jsonify({"status": "cleared"})
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, debug=False)
