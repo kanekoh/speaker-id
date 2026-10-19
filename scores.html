@@ -4,44 +4,47 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>識別スコア</title>
+  <link rel="stylesheet" href="/static/style.css">
   <link rel="stylesheet" href="/static/score-charts.css">
-  <style>
-    body { font-family: sans-serif; padding: 2em; background: #eef; max-width: 1100px; margin: 0 auto; }
-    @media (prefers-color-scheme: dark) { body { background: #111110; color: #f0efec; } a { color: #8ab4f8; } }
-    @media (max-width: 600px) { body { padding: 1em 16px; } }
-    h1 { font-size: 1.4em; }
-    .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-    .toolbar label { font-size: 0.9em; }
-  </style>
 </head>
 <body>
-  <h1>識別スコア</h1>
+  <header class="app-header">
+    <div class="app-title">話者識別</div>
+    <nav class="app-nav">
+      <a href="/">登録</a>
+      <a href="/test.html">識別テスト</a>
+      <a href="/scores.html" aria-current="page">スコア</a>
+    </nav>
+    <button id="logoutBtn" class="btn btn-ghost btn-small">ログアウト</button>
+  </header>
 
-  <div class="toolbar">
-    <button id="reloadBtn">🔄 再読み込み</button>
-    <label><input type="checkbox" id="autoReload" checked> 5秒ごとに自動更新</label>
-    <button id="clearBtn">🗑️ ログを消去</button>
-    <a href="/test.html">→ 話者識別テストへ</a>
-    <a href="/">→ 話者登録へ</a>
-  </div>
+  <main class="page">
+    <h1>識別スコア</h1>
 
-  <section class="viz-root">
-    <h2>最新の識別結果</h2>
-    <p class="viz-sub" id="latestSub"></p>
-    <div id="latestChart"></div>
-  </section>
+    <div class="actions">
+      <button id="reloadBtn" class="btn">🔄 再読み込み</button>
+      <label class="check"><input type="checkbox" id="autoReload" checked> 5秒ごとに自動更新</label>
+      <button id="clearBtn" class="btn">🗑️ ログを消去</button>
+    </div>
 
-  <section class="viz-root">
-    <h2>人ごとのスコア推移</h2>
-    <p class="viz-sub">直近50回の識別で、その人の登録音声とどれだけ似ていたか（コサイン類似度）。右ほど新しい。</p>
-    <div id="multiples"></div>
-  </section>
+    <section class="card viz-root">
+      <h2>最新の識別結果</h2>
+      <p class="card-sub" id="latestSub"></p>
+      <div id="latestChart"></div>
+    </section>
 
-  <section class="viz-root">
-    <h2>ログ</h2>
-    <p class="viz-sub">サーバーのメモリ上に直近の記録だけを保持しています（再起動で消えます）。</p>
-    <div id="logTable"></div>
-  </section>
+    <section class="card viz-root">
+      <h2>人ごとのスコア推移</h2>
+      <p class="card-sub">直近50回の識別で、その人の登録音声とどれだけ似ていたか（コサイン類似度）。右ほど新しい。</p>
+      <div id="multiples"></div>
+    </section>
+
+    <section class="card viz-root">
+      <h2>ログ</h2>
+      <p class="card-sub">サーバーのメモリ上に直近の記録だけを保持しています（再起動で消えます）。</p>
+      <div id="logTable"></div>
+    </section>
+  </main>
 
   <script src="/static/auth.js"></script>
   <script src="/static/score-charts.js"></script>
@@ -86,6 +89,7 @@
     window.onload = function () {
       Auth.ensureToken(() => { load(); setAutoReload(true); });
     };
+    document.getElementById("logoutBtn").onclick = () => Auth.logout();
     document.getElementById("reloadBtn").onclick = load;
     window.addEventListener("resize", () => { clearTimeout(window._rt); window._rt = setTimeout(load, 300); });
     document.getElementById("autoReload").onchange = (e) => setAutoReload(e.target.checked);

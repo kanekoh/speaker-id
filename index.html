@@ -2,48 +2,54 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>話者登録</title>
-  <style>
-    body { font-family: sans-serif; padding: 2em; background: #f2f2f2; }
-    h1 { color: #333; }
-    label, input, button { display: block; margin: 1em 0; }
-    #status { margin-top: 1em; font-weight: bold; }
-    .hint { color: #555; font-size: 0.9em; }
-    #profileList { border-collapse: collapse; margin: 0.5em 0 1.5em; background: #fff; }
-    #profileList th, #profileList td { border-bottom: 1px solid #ddd; padding: 4px 10px; text-align: left; }
-    #profileList td.num { text-align: right; font-variant-numeric: tabular-nums; }
-    #profileList button { display: inline; margin: 0; }
-    .low { color: #c8312f; font-weight: bold; }
-  </style>
+  <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-  <h1>話者登録</h1>
+  <header class="app-header">
+    <div class="app-title">話者識別</div>
+    <nav class="app-nav">
+      <a href="/" aria-current="page">登録</a>
+      <a href="/test.html">識別テスト</a>
+      <a href="/scores.html">スコア</a>
+    </nav>
+    <button id="logoutBtn" class="btn btn-ghost btn-small">ログアウト</button>
+  </header>
 
-  <label for="nameInput">識別名（半角英数字）:</label>
-  <input type="text" id="nameInput" placeholder="例: tanaka">
+  <main class="page">
+    <h1>話者登録</h1>
 
-  <label for="kanaInput">表示名（ひらがなや漢字など）:</label>
-  <input type="text" id="kanaInput" placeholder="例: たなかさん">
+    <section class="card">
+      <h2>声を登録する</h2>
+      <p class="card-sub">同じ識別名で何回か登録すると、録音が追加されて精度が上がります（3〜5回、できれば日や時間帯を変えて）。</p>
 
-  <button id="recordButton">🎙️ 録音開始</button>
+      <div class="field">
+        <label for="nameInput">識別名（半角英数字）</label>
+        <input type="text" id="nameInput" placeholder="例: tanaka">
+      </div>
+      <div class="field">
+        <label for="kanaInput">表示名（ひらがなや漢字など）</label>
+        <input type="text" id="kanaInput" placeholder="例: たなかさん">
+      </div>
 
-  <p>以下の文を読み上げてください（声の部分が3秒以上必要です。静かな場所でマイクに近づいて）：</p>
-  <p id="sampleText">こんにちは。私は〇〇です。スタックチャンに声を登録します。よろしくお願いします。</p>
+      <p class="hint">以下の文を読み上げてください（声の部分が3秒以上必要です。静かな場所でマイクに近づいて）</p>
+      <p id="sampleText" class="read-aloud">こんにちは。私は〇〇です。スタックチャンに声を登録します。よろしくお願いします。</p>
 
-  <button id="stopButton" disabled>⏹️ 録音終了</button>
-  <button id="uploadButton" disabled>⬆️ 登録して送信</button>
+      <div class="actions">
+        <button id="recordButton" class="btn">🎙️ 録音開始</button>
+        <button id="stopButton" class="btn" disabled>⏹️ 録音終了</button>
+        <button id="uploadButton" class="btn btn-primary" disabled>⬆️ 登録して送信</button>
+      </div>
+      <p id="status" class="status" role="status">状態: 待機中</p>
+    </section>
 
-  <p id="status">状態: 待機中</p>
-  <p class="hint">同じ識別名で何回か登録すると、録音が追加されて精度が上がります（3〜5回、できれば日や時間帯を変えて）。</p>
-
-  <h2>登録済みの話者</h2>
-  <p class="hint">一致度は、その録音が同じ人の他の録音とどれだけ似ているかです。極端に低い録音（0.5未満）は、雑音や別人の声が入っている可能性があるので削除をおすすめします。</p>
-  <div id="profiles">読み込み中...</div>
-
-  <a href="/test.html">→ 話者識別テストへ</a>
-
-  <!-- どこか分かりやすい場所に設置 -->
-  <button id="logoutBtn">ログアウト</button>
+    <section class="card">
+      <h2>登録済みの話者</h2>
+      <p class="card-sub">一致度は、その録音が同じ人の他の録音とどれだけ似ているかです。極端に低い録音（0.5未満）は、雑音や別人の声が入っている可能性があるので削除をおすすめします。</p>
+      <div id="profiles" class="empty">読み込み中...</div>
+    </section>
+  </main>
 
   <script src="/static/auth.js"></script>
   <script>
@@ -56,6 +62,12 @@
     const stopBtn = document.getElementById("stopButton");
     const uploadBtn = document.getElementById("uploadButton");
     const status = document.getElementById("status");
+
+    // 状態表示（kind: "recording" | "ok" | "error" | なし）
+    function setStatus(text, kind) {
+      status.textContent = text;
+      status.className = "status" + (kind ? ` is-${kind}` : "");
+    }
 
     // --- 認証（auth.js） ---
     window.onload = function () {
@@ -70,9 +82,10 @@
       if (!res.ok) { box.textContent = "一覧を取得できませんでした"; return; }
       const { people } = await res.json();
       if (people.length === 0) { box.textContent = "まだ登録されていません"; return; }
+      box.className = "table-wrap";
 
       const table = document.createElement("table");
-      table.id = "profileList";
+      table.className = "data-table";
       table.innerHTML = "<thead><tr><th>話者</th><th>録音日時</th><th>一致度</th><th></th></tr></thead>";
       const tbody = document.createElement("tbody");
       for (const p of people) {
@@ -81,8 +94,10 @@
           const who = document.createElement("td");
           if (i === 0) {
             who.rowSpan = p.samples.length;
+            who.className = "wrap";
             who.textContent = `${p.kana}（${p.name}）・${p.samples.length}件 `;
             const delAll = document.createElement("button");
+            delAll.className = "btn btn-small";
             delAll.textContent = "全削除";
             delAll.onclick = () => remove(`/profiles/${encodeURIComponent(p.name)}`,
               `${p.kana} さんの登録をすべて削除しますか？`);
@@ -96,6 +111,7 @@
           score.textContent = sample.consistency === null ? "–" : sample.consistency.toFixed(3);
           const action = document.createElement("td");
           const del = document.createElement("button");
+          del.className = "btn btn-small";
           del.textContent = "削除";
           del.onclick = () => remove(
             `/profiles/${encodeURIComponent(p.name)}/samples/${encodeURIComponent(sample.id)}`,
@@ -118,19 +134,18 @@
 
     document.getElementById("logoutBtn").onclick = function() {
       Auth.logout();
-      // location.reload(); // 必要に応じて有効化
     };
 
     recordBtn.onclick = async () => {
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        status.textContent = "エラー: マイクAPIが使用できません（HTTPSまたはlocalhostが必要です）";
+        setStatus("エラー: マイクAPIが使用できません（HTTPSまたはlocalhostが必要です）", "error");
         return;
       }
       let stream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       } catch (e) {
-        status.textContent = `エラー: マイクへのアクセス失敗 - ${e.name}: ${e.message}`;
+        setStatus(`エラー: マイクへのアクセス失敗 - ${e.name}: ${e.message}`, "error");
         return;
       }
       mediaRecorder = new MediaRecorder(stream);
@@ -138,12 +153,12 @@
 
       mediaRecorder.ondataavailable = e => recordedChunks.push(e.data);
       mediaRecorder.onstop = () => {
-        status.textContent = "録音終了";
+        setStatus("録音終了");
         uploadBtn.disabled = false;
       };
 
       mediaRecorder.start();
-      status.textContent = "録音中...";
+      setStatus("● 録音中...", "recording");
       recordBtn.disabled = true;
       stopBtn.disabled = false;
     };
@@ -169,7 +184,7 @@
       formData.append("name", name);
       formData.append("kana", kana);
 
-      status.textContent = "送信中...";
+      setStatus("送信中...");
       try {
         const res = await Auth.authFetch("/register", {
           method: "POST",
@@ -182,14 +197,14 @@
             msg += `、既存の録音との一致度 ${result.consistency.toFixed(3)}`;
             if (result.consistency < 0.5) msg += "（低め：録り直しを検討してください）";
           }
-          status.textContent = msg;
+          setStatus(msg, result.consistency !== null && result.consistency < 0.5 ? "error" : "ok");
           loadProfiles();
         } else {
-          status.textContent = `エラー (HTTP ${res.status}): ${result.error || JSON.stringify(result)}`;
+          setStatus(`エラー (HTTP ${res.status}): ${result.error || JSON.stringify(result)}`, "error");
         }
       } catch (e) {
         console.error(e);
-        status.textContent = `エラー発生: ${e.message}`;
+        setStatus(`エラー発生: ${e.message}`, "error");
       }
     };
   </script>

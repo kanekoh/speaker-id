@@ -24,7 +24,7 @@ window.ScoreCharts = (function () {
   let tooltip;
   function showTooltip(evt, lines) {
     if (!tooltip) {
-      tooltip = el("div", { class: "viz-root viz-tooltip", role: "tooltip" });
+      tooltip = el("div", { class: "viz-tooltip", role: "tooltip" });
       document.body.appendChild(tooltip);
     }
     tooltip.replaceChildren(...lines.map((l) => el("div", {}, l)));
@@ -58,7 +58,7 @@ window.ScoreCharts = (function () {
   function renderBars(container, scores, threshold) {
     container.replaceChildren();
     if (!scores || scores.length === 0) {
-      container.appendChild(el("p", { class: "viz-empty" }, "登録者がいません"));
+      container.appendChild(el("p", { class: "empty" }, "登録者がいません"));
       return;
     }
     // 表示幅そのままで描画し、文字サイズが画面幅で伸び縮みしないようにする
@@ -130,7 +130,7 @@ window.ScoreCharts = (function () {
     container.replaceChildren();
     const entries = data.entries.slice(-maxPoints);
     if (data.people.length === 0 || entries.length === 0) {
-      container.appendChild(el("p", { class: "viz-empty" }, "まだ識別の記録がありません"));
+      container.appendChild(el("p", { class: "empty" }, "まだ識別の記録がありません"));
       return;
     }
     const grid = el("div", { class: "viz-multiples" });
@@ -197,11 +197,11 @@ window.ScoreCharts = (function () {
   function renderTable(container, data) {
     container.replaceChildren();
     if (data.entries.length === 0) {
-      container.appendChild(el("p", { class: "viz-empty" }, "まだ識別の記録がありません"));
+      container.appendChild(el("p", { class: "empty" }, "まだ識別の記録がありません"));
       return;
     }
-    const wrap = el("div", { class: "viz-table-wrap" });
-    const table = el("table", { class: "viz-table" });
+    const wrap = el("div", { class: "table-wrap" });
+    const table = el("table", { class: "data-table" });
     const head = el("tr");
     ["時刻", "送信元", "判定", "声の長さ", "最高スコア", ...data.people.map((p) => p.kana || p.name)]
       .forEach((h) => head.appendChild(el("th", {}, h)));

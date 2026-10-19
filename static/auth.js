@@ -6,25 +6,36 @@ window.Auth = (function () {
     localStorage.removeItem("api_token");
     apiToken = "";
     // 認証ダイアログを再表示
-    showTokenDialog();
+    showTokenDialog(() => location.reload());
   }
 
-  // トークン入力ダイアログ作成・表示
+  // トークン入力ダイアログ作成・表示（見た目は style.css の .auth-*）
   function showTokenDialog(onSuccess) {
-    let dlg = document.createElement("div");
-    dlg.style = "background:#fff;border:1px solid #ccc;padding:2em;position:fixed;top:20vh;left:50%;transform:translateX(-50%);z-index:10";
-    dlg.innerHTML = `
-      <label>APIトークンを入力してください</label>
-      <input type="password" id="tokenInput" autocomplete="off">
-      <button id="tokenBtn">認証して開始</button>
-      <p id="tokenStatus" style="color:red"></p>
+    const backdrop = document.createElement("div");
+    backdrop.className = "auth-backdrop";
+    backdrop.innerHTML = `
+      <form class="card auth-dialog" role="dialog" aria-modal="true" aria-labelledby="tokenTitle">
+        <h2 id="tokenTitle">APIトークンを入力してください</h2>
+        <div class="field">
+          <label for="tokenInput">APIトークン</label>
+          <input type="password" id="tokenInput" autocomplete="off">
+        </div>
+        <div class="actions">
+          <button type="submit" id="tokenBtn" class="btn btn-primary">認証して開始</button>
+        </div>
+        <p id="tokenStatus" class="auth-error" role="alert"></p>
+      </form>
     `;
-    document.body.appendChild(dlg);
+    document.body.appendChild(backdrop);
+    const input = backdrop.querySelector("#tokenInput");
+    const status = backdrop.querySelector("#tokenStatus");
+    input.focus();
 
-    document.getElementById("tokenBtn").onclick = async function () {
-      const token = document.getElementById("tokenInput").value.trim();
+    backdrop.querySelector("form").onsubmit = async function (e) {
+      e.preventDefault();
+      const token = input.value.trim();
       if (!token) {
-        document.getElementById("tokenStatus").textContent = "トークンを入力してください";
+        status.textContent = "トークンを入力してください";
         return;
       }
       // /check_token でバリデーション
@@ -35,13 +46,13 @@ window.Auth = (function () {
         if (res.ok) {
           localStorage.setItem("api_token", token);
           apiToken = token;
-          dlg.remove();
+          backdrop.remove();
           if (onSuccess) onSuccess(token);
         } else {
-          document.getElementById("tokenStatus").textContent = "認証失敗。正しいトークンを入力してください";
+          status.textContent = "認証失敗。正しいトークンを入力してください";
         }
       } catch {
-        document.getElementById("tokenStatus").textContent = "通信エラー";
+        status.textContent = "通信エラー";
       }
     };
   }

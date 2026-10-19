@@ -1,0 +1,172 @@
+/* 全画面共通のスタイル */
+:root {
+  color-scheme: light;
+  --page-bg: #f3f2ef;
+  --surface-1: #fcfcfb;
+  --surface-2: #f3f2ef;
+  --border: #dcdbd6;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #77766f;
+  --grid: #e6e5e0;
+  --accent: #2a78d6;
+  --accent-hover: #1f64b8;
+  --accent-text: #ffffff;
+  --series-1: #2a78d6;
+  --bar-muted: #b9b8b1;
+  --threshold: #52514e;
+  --good: #008300;
+  --critical: #c8312f;
+  --focus: #2a78d6;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page-bg: #111110;
+    --surface-1: #1a1a19;
+    --surface-2: #242422;
+    --border: #3a3a37;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #9a998f;
+    --grid: #2f2f2c;
+    --accent: #3987e5;
+    --accent-hover: #5a9cec;
+    --accent-text: #ffffff;
+    --series-1: #3987e5;
+    --bar-muted: #5c5b55;
+    --threshold: #c3c2b7;
+    --good: #3fae3f;
+    --critical: #e66767;
+    --focus: #5a9cec;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page-bg: #111110;
+  --surface-1: #1a1a19;
+  --surface-2: #242422;
+  --border: #3a3a37;
+  --text-primary: #f0efec;
+  --text-secondary: #c3c2b7;
+  --text-muted: #9a998f;
+  --grid: #2f2f2c;
+  --accent: #3987e5;
+  --accent-hover: #5a9cec;
+  --accent-text: #ffffff;
+  --series-1: #3987e5;
+  --bar-muted: #5c5b55;
+  --threshold: #c3c2b7;
+  --good: #3fae3f;
+  --critical: #e66767;
+  --focus: #5a9cec;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--page-bg);
+  color: var(--text-primary);
+  font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+  line-height: 1.6;
+}
+a { color: var(--accent); }
+
+/* ---- ヘッダー ---- */
+.app-header {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px;
+  padding: 10px 24px;
+  background: var(--surface-1);
+  border-bottom: 1px solid var(--border);
+}
+.app-title { font-weight: bold; }
+.app-nav { display: flex; gap: 4px; flex: 1; flex-wrap: wrap; }
+.app-nav a {
+  color: var(--text-secondary); text-decoration: none;
+  padding: 4px 12px; border-radius: 6px;
+}
+.app-nav a:hover { background: var(--surface-2); color: var(--text-primary); }
+.app-nav a[aria-current="page"] { background: var(--surface-2); color: var(--text-primary); font-weight: bold; }
+
+/* ---- ページ本体 ---- */
+.page { max-width: 1100px; margin: 0 auto; padding: 24px; }
+.page > h1 { font-size: 1.4em; margin: 0 0 16px; }
+@media (max-width: 600px) {
+  .app-header { padding: 10px 16px; justify-content: space-between; }
+  .app-nav { order: 3; flex-basis: 100%; flex-wrap: nowrap; }
+  .page { padding: 16px; }
+}
+
+.card {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  margin: 0 0 16px;
+  max-width: 100%;
+}
+.card > h2 { font-size: 1.05em; margin: 0 0 4px; }
+.card-sub, .hint { color: var(--text-secondary); font-size: 0.85em; margin: 0 0 12px; }
+
+/* ---- フォーム ---- */
+.field { display: flex; flex-direction: column; gap: 4px; margin: 0 0 12px; max-width: 360px; }
+.field label { font-size: 0.9em; color: var(--text-secondary); }
+input[type="text"], input[type="password"] {
+  font: inherit; color: var(--text-primary);
+  background: var(--surface-1);
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 10px;
+}
+input:focus-visible, button:focus-visible, a:focus-visible {
+  outline: 2px solid var(--focus); outline-offset: 2px;
+}
+
+.actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0; }
+.btn {
+  font: inherit; font-size: 0.95em;
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 14px; border-radius: 6px; cursor: pointer;
+  background: var(--surface-1); color: var(--text-primary);
+  border: 1px solid var(--border);
+}
+.btn:hover:not(:disabled) { background: var(--surface-2); }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+.btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+.btn-ghost { border-color: transparent; background: transparent; color: var(--text-secondary); }
+.btn-small { padding: 2px 10px; font-size: 0.85em; }
+.check { display: inline-flex; align-items: center; gap: 6px; font-size: 0.9em; color: var(--text-secondary); }
+
+.read-aloud {
+  background: var(--surface-2); border-radius: 6px;
+  padding: 10px 14px; margin: 8px 0 12px;
+}
+
+.status { font-weight: bold; margin: 8px 0 0; }
+.status.is-recording { color: var(--critical); }
+.status.is-ok { color: var(--good); }
+.status.is-error { color: var(--critical); }
+
+/* ---- 表 ---- */
+.table-wrap { overflow-x: auto; }
+.data-table { border-collapse: collapse; font-size: 0.9em; width: 100%; }
+.data-table th, .data-table td {
+  border-bottom: 1px solid var(--grid);
+  padding: 6px 10px; text-align: left; white-space: nowrap; vertical-align: middle;
+}
+.data-table th { color: var(--text-secondary); font-weight: normal; }
+.data-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.data-table td.wrap { white-space: normal; min-width: 8em; }
+.data-table .low { color: var(--critical); font-weight: bold; }
+.empty { color: var(--text-muted); font-size: 0.9em; }
+
+/* ---- トークン入力ダイアログ（auth.js） ---- */
+.auth-backdrop {
+  position: fixed; inset: 0; z-index: 10;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: 20vh 16px 0;
+}
+.auth-dialog { width: 100%; max-width: 380px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2); }
+.auth-dialog .field { max-width: none; }
+.auth-error { color: var(--critical); font-size: 0.9em; min-height: 1.4em; margin: 4px 0 0; }

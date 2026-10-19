@@ -2,35 +2,42 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
-  <title>話者確認テスト</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>話者識別テスト</title>
+  <link rel="stylesheet" href="/static/style.css">
   <link rel="stylesheet" href="/static/score-charts.css">
-  <style>
-    body { font-family: sans-serif; padding: 2em; background: #eef; }
-    h1 { color: #333; }
-    button { margin: 1em 0; }
-    #result { font-weight: bold; margin-top: 1em; }
-  </style>
 </head>
 <body>
-  <h1>話者識別テスト</h1>
+  <header class="app-header">
+    <div class="app-title">話者識別</div>
+    <nav class="app-nav">
+      <a href="/">登録</a>
+      <a href="/test.html" aria-current="page">識別テスト</a>
+      <a href="/scores.html">スコア</a>
+    </nav>
+    <button id="logoutBtn" class="btn btn-ghost btn-small">ログアウト</button>
+  </header>
 
-  <button id="recordBtn">🎙️ 録音開始</button>
-  <button id="stopBtn" disabled>⏹️ 録音終了</button>
-  <button id="identifyBtn" disabled>🔍 確認</button>
+  <main class="page">
+    <h1>話者識別テスト</h1>
 
-  <p id="result">状態: 待機中</p>
-  <p>1〜2秒以上、はっきり話してから止めてください。</p>
+    <section class="card">
+      <h2>録音して識別する</h2>
+      <p class="card-sub">1〜2秒以上、はっきり話してから止めてください。</p>
+      <div class="actions">
+        <button id="recordBtn" class="btn">🎙️ 録音開始</button>
+        <button id="stopBtn" class="btn" disabled>⏹️ 録音終了</button>
+        <button id="identifyBtn" class="btn btn-primary" disabled>🔍 確認</button>
+      </div>
+      <p id="result" class="status" role="status">状態: 待機中</p>
+    </section>
 
-  <section class="viz-root" id="scoreSection" hidden>
-    <h2>登録者ごとのスコア</h2>
-    <p class="viz-sub">今回の音声が各登録者とどれだけ似ていたか（コサイン類似度）。点線より右なら本人と判定。</p>
-    <div id="scoreChart"></div>
-  </section>
-
-  <a href="/scores.html">→ スコアの履歴を見る</a><br>
-  <a href="/">→ 話者登録画面へ戻る</a>
-  <!-- どこか分かりやすい場所に設置 -->
-  <button id="logoutBtn">ログアウト</button>
+    <section class="card viz-root" id="scoreSection" hidden>
+      <h2>登録者ごとのスコア</h2>
+      <p class="card-sub">今回の音声が各登録者とどれだけ似ていたか（コサイン類似度）。点線より右なら本人と判定。過去の結果は「スコア」画面で見られます。</p>
+      <div id="scoreChart"></div>
+    </section>
+  </main>
 
   <script src="/static/auth.js"></script>
   <script src="/static/score-charts.js"></script>
@@ -43,6 +50,12 @@
     const identifyBtn = document.getElementById("identifyBtn");
     const result = document.getElementById("result");
 
+    // 状態表示（kind: "recording" | "ok" | "error" | なし）
+    function setResult(text, kind) {
+      result.textContent = text;
+      result.className = "status" + (kind ? ` is-${kind}` : "");
+    }
+
         // ページ初回認証
     window.onload = function() {
       Auth.ensureToken();
@@ -50,7 +63,6 @@
 
     document.getElementById("logoutBtn").onclick = function() {
       Auth.logout();
-      // location.reload(); // 必要に応じて有効化
     };
 
     recordBtn.onclick = async () => {
@@ -60,12 +72,12 @@
 
       mediaRecorder.ondataavailable = e => recordedChunks.push(e.data);
       mediaRecorder.onstop = () => {
-        result.textContent = "録音完了";
+        setResult("録音完了");
         identifyBtn.disabled = false;
       };
 
       mediaRecorder.start();
-      result.textContent = "録音中...";
+      setResult("● 録音中...", "recording");
       recordBtn.disabled = true;
       stopBtn.disabled = false;
     };
@@ -82,7 +94,7 @@
       formData.append("audio", blob, "test.wav");
       formData.append("source", "test");
 
-      result.textContent = "識別中...";
+      setResult("識別中...");
 
       try {
         const res = await Auth.authFetch("/identify", {
@@ -91,13 +103,13 @@
         });
         const data = await res.json();
         if (data.reason === "too_short") {
-          result.textContent = `声が短すぎます（${data.speech_sec}秒）。もう少し長く話してください`;
+          setResult(`声が短すぎます（${data.speech_sec}秒）。もう少し長く話してください`, "error");
         } else if (data.name) {
-          result.textContent = `認識された人: ${data.kana}（スコア: ${data.score}）`;
+          setResult(`✓ 認識された人: ${data.kana}（スコア: ${data.score}）`, "ok");
         } else {
-          result.textContent = data.candidate
-            ? `識別できませんでした（最有力: ${data.candidate}、スコア: ${data.score}）`
-            : `識別できませんでした`;
+          setResult(data.candidate
+            ? `✗ 識別できませんでした（最有力: ${data.candidate}、スコア: ${data.score}）`
+            : "✗ 識別できませんでした", "error");
         }
         document.getElementById("scoreSection").hidden = !(data.scores && data.scores.length);
         if (data.scores && data.scores.length) {
@@ -106,7 +118,7 @@
         }
       } catch (e) {
         console.error(e);
-        result.textContent = "エラーが発生しました";
+        setResult("エラーが発生しました", "error");
       }
     };
   </script>
