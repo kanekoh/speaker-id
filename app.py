@@ -68,31 +68,70 @@ def require_auth():
     if not check_auth():
         abort(401, description="Unauthorized")
 
-def get_embedding_from_bytes(audio_bytes: bytes) -> np.ndarray:
-    """任意フォーマット（webm/ogg/wav等）の音声バイト列から話者埋め込みベクトルを抽出する"""
+# 無音除去・長さチェックの設定
+FRAME_SEC = 0.03            # 音量を判定するフレーム長
+SILENCE_FLOOR_DB = -50.0    # これより小さい音は常に無音扱い（dBFS）
+SILENCE_RANGE_DB = 30.0     # 最も大きいフレームからこれ以上小さいフレームを無音扱い
+SPEECH_PAD_FRAMES = 5       # 声の前後に残す余白（フレーム数、5 × 30ms = 150ms）
+MIN_REGISTER_SEC = float(os.getenv("SPEAKER_MIN_REGISTER_SEC", "3.0"))
+MIN_IDENTIFY_SEC = float(os.getenv("SPEAKER_MIN_IDENTIFY_SEC", "1.0"))
+# 前処理を変えたら上げる（保存済みの埋め込みキャッシュを作り直させるため）
+PREPROCESS_VERSION = "vad1"
+
+
+def decode_audio_bytes(audio_bytes: bytes):
+    """任意フォーマット（webm/ogg/wav等）の音声バイト列を (波形, サンプルレート) にする"""
     audio_seg = AudioSegment.from_file(io.BytesIO(audio_bytes))
     wav_buf = io.BytesIO()
     audio_seg.export(wav_buf, format="wav")
     wav_buf.seek(0)
-    audio, sr = sf.read(wav_buf, dtype='float32')
-    return get_embedding_from_array(audio, sr)
+    return sf.read(wav_buf, dtype='float32')
 
-def get_embedding_from_array(audio: np.ndarray, sr: int) -> np.ndarray:
-    """音声配列から話者埋め込みベクトルを抽出する"""
-    # モノラル化
+
+def trim_silence(audio: np.ndarray) -> np.ndarray:
+    """フレームごとの音量で無音区間を取り除き、声のある部分だけをつなげて返す"""
+    frame = int(SAMPLE_RATE * FRAME_SEC)
+    n = len(audio) // frame
+    if n == 0:
+        return audio[:0]
+    frames = audio[:n * frame].reshape(n, frame)
+    rms_db = 20 * np.log10(np.sqrt(np.mean(frames ** 2, axis=1)) + 1e-10)
+    threshold = max(SILENCE_FLOOR_DB, rms_db.max() - SILENCE_RANGE_DB)
+    voiced = rms_db > threshold
+    # 語頭・語尾が切れないよう、声のあるフレームの前後も残す
+    kernel = np.ones(2 * SPEECH_PAD_FRAMES + 1)
+    voiced = np.convolve(voiced, kernel, mode="same") > 0
+    return frames[voiced].reshape(-1)
+
+
+def preprocess(audio: np.ndarray, sr: int) -> np.ndarray:
+    """モノラル化・16kHz へのリサンプリング・無音除去をした波形を返す"""
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
-    # 16kHz にリサンプリング
     if sr != SAMPLE_RATE:
         num_samples = int(len(audio) * SAMPLE_RATE / sr)
         audio = scipy_signal.resample(audio, num_samples)
-    audio = audio.astype(np.float32)
+    return trim_silence(audio.astype(np.float32))
+
+
+def speech_seconds(speech: np.ndarray) -> float:
+    return len(speech) / SAMPLE_RATE
+
+
+def embed(speech: np.ndarray) -> np.ndarray:
+    """前処理済みの波形から話者埋め込みベクトルを抽出する"""
     stream = extractor.create_stream()
-    stream.accept_waveform(SAMPLE_RATE, audio)
+    stream.accept_waveform(SAMPLE_RATE, speech)
     stream.input_finished()
     embedding = np.array(extractor.compute(stream), dtype=np.float32)
     # sherpa-onnx の埋め込みは未正規化なので、内積=コサイン類似度になるよう L2 正規化する
     return embedding / (np.linalg.norm(embedding) + 1e-9)
+
+
+def get_embedding_from_array(audio: np.ndarray, sr: int) -> np.ndarray:
+    """音声配列から話者埋め込みベクトルを抽出する"""
+    return embed(preprocess(audio, sr))
+
 
 def get_embedding_from_file(filepath: str) -> np.ndarray:
     """WAVファイルから話者埋め込みベクトルを抽出する"""
@@ -123,6 +162,8 @@ def _model_tag() -> str:
 
 
 MODEL_TAG = _model_tag()
+# 埋め込みキャッシュ（.npy）のファイル名に入れる識別子
+EMBED_TAG = f"{MODEL_TAG}-{PREPROCESS_VERSION}"
 
 # メタ情報読み込み
 if os.path.exists(META_FILE):
@@ -153,9 +194,13 @@ def centroid(embeddings) -> np.ndarray:
     return mean / (np.linalg.norm(mean) + 1e-9)
 
 
+def cache_path_for(wav_path: str) -> str:
+    return f"{wav_path[:-4]}.{EMBED_TAG}.npy"
+
+
 def load_sample_embedding(wav_path: str) -> np.ndarray:
     """登録音声の埋め込みを返す。計算済みの .npy があればそれを使う"""
-    cache_path = f"{wav_path[:-4]}.{MODEL_TAG}.npy"
+    cache_path = cache_path_for(wav_path)
     if os.path.exists(cache_path) and os.path.getmtime(cache_path) >= os.path.getmtime(wav_path):
         return np.load(cache_path)
     embedding = get_embedding_from_file(wav_path)
@@ -210,6 +255,10 @@ def load_profiles():
         if not (NAME_RE.match(name) and os.path.isdir(person_dir(name))):
             continue
         for filename in sorted(os.listdir(person_dir(name))):
+            if filename.endswith(".npy") and not filename.endswith(f".{EMBED_TAG}.npy"):
+                # モデルや前処理が変わって使われなくなったキャッシュを消す
+                os.remove(os.path.join(person_dir(name), filename))
+                continue
             if not filename.endswith(".wav"):
                 continue
             try:
@@ -219,7 +268,7 @@ def load_profiles():
                 logging.error(f"[startup] Could not load '{name}/{filename}': {e}")
         refresh_profile(name)
     log(f"[startup] loaded {len(profiles)} speakers, "
-        f"{sum(len(v) for v in samples.values())} samples (model {MODEL_TAG})")
+        f"{sum(len(v) for v in samples.values())} samples (embedding {EMBED_TAG})")
 
 
 load_profiles()
@@ -318,8 +367,18 @@ def register():
 
     try:
         t0 = time.time()
-        embedding = load_sample_embedding(save_path)
-        print(f"[register] get_embedding took {time.time() - t0:.3f} sec")
+        speech = preprocess(*sf.read(save_path, dtype='float32'))
+        speech_sec = speech_seconds(speech)
+        if speech_sec < MIN_REGISTER_SEC:
+            os.remove(save_path)
+            return jsonify({
+                "error": f"声の部分が短すぎます（{speech_sec:.1f}秒）。"
+                         f"{MIN_REGISTER_SEC:.0f}秒以上話してください",
+                "speech_sec": round(speech_sec, 2),
+            }), 400
+        embedding = embed(speech)
+        np.save(cache_path_for(save_path), embedding)
+        print(f"[register] get_embedding took {time.time() - t0:.3f} sec (speech {speech_sec:.1f}s)")
     except Exception as e:
         logging.exception("[register] get_embedding failed")
         os.remove(save_path)
@@ -344,6 +403,7 @@ def register():
         "sample_id": sample_id,
         "num_samples": len(samples[name]),
         "consistency": consistency,
+        "speech_sec": round(speech_sec, 2),
     })
 
 
@@ -409,10 +469,35 @@ def identify():
     file = request.files["audio"]
     audio_bytes = file.read()
 
+    source = request.form.get("source", "api")
     try:
         t0 = time.time()
-        embedding = get_embedding_from_bytes(audio_bytes)
-        log(f"[identify] get_embedding took {time.time() - t0:.3f} sec")
+        speech = preprocess(*decode_audio_bytes(audio_bytes))
+        speech_sec = speech_seconds(speech)
+        if speech_sec < MIN_IDENTIFY_SEC:
+            log(f"[identify] too short: speech {speech_sec:.2f}s < {MIN_IDENTIFY_SEC}s")
+            identify_log.append({
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "source": source,
+                "result": None,
+                "candidate": None,
+                "score": None,
+                "scores": {},
+                "speech_sec": round(speech_sec, 2),
+                "reason": "too_short",
+            })
+            return jsonify({
+                "name": None,
+                "kana": None,
+                "score": None,
+                "candidate": None,
+                "threshold": SCORE_THRESHOLD,
+                "scores": [],
+                "speech_sec": round(speech_sec, 2),
+                "reason": "too_short",
+            })
+        embedding = embed(speech)
+        log(f"[identify] get_embedding took {time.time() - t0:.3f} sec (speech {speech_sec:.1f}s)")
     except Exception as e:
         logging.exception("[identify] get_embedding failed")
         return jsonify({"error": str(e)}), 500
@@ -427,11 +512,13 @@ def identify():
     accepted = best_name is not None and best_score >= SCORE_THRESHOLD
     identify_log.append({
         "time": datetime.now().isoformat(timespec="seconds"),
-        "source": request.form.get("source", "api"),
+        "source": source,
         "result": best_name if accepted else None,
         "candidate": best_name,
         "score": round(best_score, 3),
         "scores": {name: round(score, 3) for name, score in scores.items()},
+        "speech_sec": round(speech_sec, 2),
+        "reason": None if accepted else "below_threshold",
     })
     score_list = [
         {"name": name, "kana": metadata.get(name, {}).get("kana", name), "score": round(score, 3)}
@@ -449,6 +536,8 @@ def identify():
             "candidate": best_name,
             "threshold": SCORE_THRESHOLD,
             "scores": score_list,
+            "speech_sec": round(speech_sec, 2),
+            "reason": "below_threshold",
         })
 
     kana = metadata.get(best_name, {}).get("kana", best_name)
@@ -458,6 +547,8 @@ def identify():
         "score": round(best_score, 3),
         "threshold": SCORE_THRESHOLD,
         "scores": score_list,
+        "speech_sec": round(speech_sec, 2),
+        "reason": None,
     })
 
 @app.route("/identify_log", methods=["GET"])

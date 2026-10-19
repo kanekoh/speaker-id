@@ -61,9 +61,15 @@
           .map(([name, score]) => ({ name, kana: kana[name] || name, score }))
           .sort((a, b) => b.score - a.score);
         latestSub.textContent = `${last.time.replace("T", " ")}（${last.source}）: `
-          + (last.result ? `✓ ${last.result} と判定` : "✗ 該当なし")
+          + (last.result ? `✓ ${last.result} と判定`
+             : last.reason === "too_short" ? "✗ 声が短すぎるため識別せず" : "✗ 該当なし")
+          + (last.speech_sec != null ? `　声の長さ ${last.speech_sec}秒` : "")
           + `　閾値 ${data.threshold}`;
-        ScoreCharts.renderBars(document.getElementById("latestChart"), scores, data.threshold);
+        if (scores.length) {
+          ScoreCharts.renderBars(document.getElementById("latestChart"), scores, data.threshold);
+        } else {
+          document.getElementById("latestChart").replaceChildren();
+        }
       } else {
         latestSub.textContent = "まだ識別の記録がありません";
         document.getElementById("latestChart").replaceChildren();

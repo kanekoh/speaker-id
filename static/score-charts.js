@@ -203,7 +203,7 @@ window.ScoreCharts = (function () {
     const wrap = el("div", { class: "viz-table-wrap" });
     const table = el("table", { class: "viz-table" });
     const head = el("tr");
-    ["時刻", "送信元", "判定", "最高スコア", ...data.people.map((p) => p.kana || p.name)]
+    ["時刻", "送信元", "判定", "声の長さ", "最高スコア", ...data.people.map((p) => p.kana || p.name)]
       .forEach((h) => head.appendChild(el("th", {}, h)));
     table.appendChild(el("thead")).appendChild(head);
     const body = el("tbody");
@@ -213,7 +213,10 @@ window.ScoreCharts = (function () {
       tr.appendChild(el("td", {}, e.source));
       tr.appendChild(e.result
         ? el("td", { class: "viz-status-ok" }, `✓ ${e.result}`)
-        : el("td", { class: "viz-status-ng" }, `✗ 該当なし${e.candidate ? `（${e.candidate}）` : ""}`));
+        : e.reason === "too_short"
+          ? el("td", { class: "viz-status-ng" }, "✗ 短すぎ")
+          : el("td", { class: "viz-status-ng" }, `✗ 該当なし${e.candidate ? `（${e.candidate}）` : ""}`));
+      tr.appendChild(el("td", { class: "num" }, e.speech_sec == null ? "–" : `${e.speech_sec.toFixed(1)}秒`));
       tr.appendChild(el("td", { class: "num" }, fmt(e.score)));
       for (const p of data.people) tr.appendChild(el("td", { class: "num" }, fmt(e.scores[p.name])));
       body.appendChild(tr);

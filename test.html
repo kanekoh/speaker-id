@@ -19,6 +19,7 @@
   <button id="identifyBtn" disabled>🔍 確認</button>
 
   <p id="result">状態: 待機中</p>
+  <p>1〜2秒以上、はっきり話してから止めてください。</p>
 
   <section class="viz-root" id="scoreSection" hidden>
     <h2>登録者ごとのスコア</h2>
@@ -89,14 +90,17 @@
           body: formData
         });
         const data = await res.json();
-        if (data.name) {
+        if (data.reason === "too_short") {
+          result.textContent = `声が短すぎます（${data.speech_sec}秒）。もう少し長く話してください`;
+        } else if (data.name) {
           result.textContent = `認識された人: ${data.kana}（スコア: ${data.score}）`;
         } else {
           result.textContent = data.candidate
             ? `識別できませんでした（最有力: ${data.candidate}、スコア: ${data.score}）`
             : `識別できませんでした`;
         }
-        if (data.scores) {
+        document.getElementById("scoreSection").hidden = !(data.scores && data.scores.length);
+        if (data.scores && data.scores.length) {
           document.getElementById("scoreSection").hidden = false;
           ScoreCharts.renderBars(document.getElementById("scoreChart"), data.scores, data.threshold);
         }

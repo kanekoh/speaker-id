@@ -27,7 +27,7 @@
 
   <button id="recordButton">🎙️ 録音開始</button>
 
-  <p>以下の文を読み上げてください：</p>
+  <p>以下の文を読み上げてください（声の部分が3秒以上必要です。静かな場所でマイクに近づいて）：</p>
   <p id="sampleText">こんにちは。私は〇〇です。スタックチャンに声を登録します。よろしくお願いします。</p>
 
   <button id="stopButton" disabled>⏹️ 録音終了</button>
@@ -177,7 +177,7 @@
         });
         const result = await res.json();
         if (res.ok) {
-          let msg = `登録成功: ${result.kana}（ID: ${result.name}）・${result.num_samples}件目`;
+          let msg = `登録成功: ${result.kana}（ID: ${result.name}）・${result.num_samples}件目・声の長さ ${result.speech_sec}秒`;
           if (result.consistency !== null) {
             msg += `、既存の録音との一致度 ${result.consistency.toFixed(3)}`;
             if (result.consistency < 0.5) msg += "（低め：録り直しを検討してください）";

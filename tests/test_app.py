@@ -85,7 +85,20 @@ def _register(client, name, kana=""):
     )
 
 
-def _make_wav(duration_samples: int = 16000) -> io.BytesIO:
+def _make_speech_wav(speech_sec: float, silence_sec: float) -> io.BytesIO:
+    """前後に無音を挟んだ「声」（正弦波）の WAV を作る"""
+    import soundfile as sf
+
+    sr = 16000
+    tone = 0.3 * np.sin(2 * np.pi * 200 * np.arange(int(speech_sec * sr)) / sr)
+    silence = np.zeros(int(silence_sec * sr / 2))
+    buf = io.BytesIO()
+    sf.write(buf, np.concatenate([silence, tone, silence]).astype(np.float32), sr, format="WAV")
+    buf.seek(0)
+    return buf
+
+
+def _make_wav(duration_samples: int = 16000 * 4) -> io.BytesIO:
     """soundfile でダミー WAV を生成して BytesIO で返す"""
     import soundfile as sf
 
@@ -237,6 +250,19 @@ class TestRegister:
         assert len(app_module.samples["alice"]) == 2
         assert np.isclose(np.linalg.norm(app_module.profiles["alice"]), 1.0)
 
+    def test_register_rejects_short_speech(self, client, isolated_profiles):
+        """無音を除いた声が短すぎる録音は 400 で、ファイルも残らない"""
+        resp = client.post(
+            "/register",
+            headers=AUTH,
+            data={"name": "alice", "audio": (_make_speech_wav(1.0, silence_sec=3.0), "a.wav", "audio/wav")},
+            content_type="multipart/form-data",
+        )
+        assert resp.status_code == 400
+        assert resp.get_json()["speech_sec"] < app_module.MIN_REGISTER_SEC
+        assert "alice" not in app_module.profiles
+        assert not list(isolated_profiles.glob("alice/*.wav"))
+
     @pytest.mark.parametrize("name", ["../evil", "a/b", "田中", "a b"])
     def test_register_rejects_invalid_name(self, client, isolated_profiles, name):
         """パスに使えない識別名は 400"""
@@ -304,6 +330,17 @@ class TestLoadProfiles:
         assert len(list((isolated_profiles / "bob").glob("*.wav"))) == 1
         assert "bob" in app_module.profiles
 
+    def test_stale_cache_is_removed(self, isolated_profiles):
+        """モデル・前処理が違う古いキャッシュは削除され、作り直される"""
+        import soundfile as sf
+        (isolated_profiles / "dave").mkdir()
+        sf.write(isolated_profiles / "dave" / "20260101-000000-000.wav",
+                 np.random.rand(16000).astype(np.float32), 16000)
+        np.save(isolated_profiles / "dave" / "20260101-000000-000.oldtag.npy", np.zeros(192))
+        app_module.load_profiles()
+        npys = sorted(p.name for p in (isolated_profiles / "dave").glob("*.npy"))
+        assert npys == [f"20260101-000000-000.{app_module.EMBED_TAG}.npy"]
+
     def test_embedding_cache_is_used(self, isolated_profiles, monkeypatch):
         """2回目の読み込みでは .npy キャッシュを使い、埋め込みを再計算しない"""
         import soundfile as sf
@@ -311,7 +348,7 @@ class TestLoadProfiles:
         sf.write(isolated_profiles / "carol" / "20260101-000000-000.wav",
                  np.random.rand(16000).astype(np.float32), 16000)
         app_module.load_profiles()
-        assert list((isolated_profiles / "carol").glob(f"*.{app_module.MODEL_TAG}.npy"))
+        assert list((isolated_profiles / "carol").glob(f"*.{app_module.EMBED_TAG}.npy"))
 
         def fail(*args, **kwargs):
             raise AssertionError("cache not used")
@@ -387,6 +424,34 @@ class TestIdentify:
         assert data["name"] is None
         assert data["kana"] is None
         assert data["candidate"] == "dave"
+
+    def test_identify_too_short(self, client, monkeypatch):
+        """声が短すぎると name=null・reason=too_short が返り、履歴にも残る"""
+        monkeypatch.setattr(app_module, "profiles", {"alice": np.ones(192, dtype=np.float32)})
+        app_module.identify_log.clear()
+        resp = client.post(
+            "/identify",
+            headers=AUTH,
+            data={"audio": (_make_speech_wav(0.3, silence_sec=2.0), "q.wav", "audio/wav")},
+            content_type="multipart/form-data",
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["name"] is None
+        assert data["reason"] == "too_short"
+        assert data["speech_sec"] < app_module.MIN_IDENTIFY_SEC
+        assert app_module.identify_log[-1]["reason"] == "too_short"
+
+    def test_identify_silence_only(self, client, monkeypatch):
+        """無音だけの音声も too_short になる"""
+        monkeypatch.setattr(app_module, "profiles", {"alice": np.ones(192, dtype=np.float32)})
+        resp = client.post(
+            "/identify",
+            headers=AUTH,
+            data={"audio": (_make_speech_wav(0.0, silence_sec=3.0), "q.wav", "audio/wav")},
+            content_type="multipart/form-data",
+        )
+        assert resp.get_json()["reason"] == "too_short"
 
     def test_identify_response_schema(self, client, monkeypatch):
         """レスポンスに name / kana / score キーが含まれる"""
@@ -472,6 +537,25 @@ class TestEmbedding:
         audio = np.random.rand(16000).astype(np.float32)
         emb = app_module.get_embedding_from_array(audio, 16000)
         assert np.isclose(np.linalg.norm(emb), 1.0, atol=1e-5)
+
+
+class TestTrimSilence:
+    def test_removes_leading_and_trailing_silence(self):
+        """前後の無音が除かれ、声の長さ＋余白程度になる"""
+        sr = app_module.SAMPLE_RATE
+        tone = 0.3 * np.sin(2 * np.pi * 200 * np.arange(2 * sr) / sr)
+        audio = np.concatenate([np.zeros(sr), tone, np.zeros(sr)]).astype(np.float32)
+        trimmed = app_module.trim_silence(audio)
+        pad = 2 * app_module.SPEECH_PAD_FRAMES * app_module.FRAME_SEC
+        assert 2.0 <= len(trimmed) / sr <= 2.0 + pad + 0.05
+
+    def test_quiet_noise_is_silence(self):
+        """-50dBFS 未満の小さな雑音だけなら何も残らない"""
+        audio = (0.001 * np.random.randn(16000 * 2)).astype(np.float32)
+        assert len(app_module.trim_silence(audio)) == 0
+
+    def test_too_short_input(self):
+        assert len(app_module.trim_silence(np.zeros(10, dtype=np.float32))) == 0
 
 
 # -----------------------------------------------------------------------
