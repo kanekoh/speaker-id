@@ -1,4 +1,7 @@
 import os
+import re
+import hashlib
+import shutil
 from flask import Flask, request, jsonify, send_from_directory, abort, send_file
 import sherpa_onnx
 import numpy as np
@@ -97,9 +100,29 @@ def get_embedding_from_file(filepath: str) -> np.ndarray:
     return get_embedding_from_array(audio, sr)
 
 # ディレクトリの初期化
-PROFILE_DIR = "profiles"
+# profiles/<name>/<sample_id>.wav に 1 人あたり複数の登録音声を置く
+PROFILE_DIR = os.getenv("SPEAKER_PROFILE_DIR", "profiles")
 META_FILE = os.path.join(PROFILE_DIR, "metadata.json")
 os.makedirs(PROFILE_DIR, exist_ok=True)
+
+# 識別名はディレクトリ名に使うので英数字・_・- のみ許可する
+NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+SAMPLE_ID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9]{3}$")
+
+
+def _model_tag() -> str:
+    """モデルファイルの識別子（埋め込みキャッシュの無効化に使う）"""
+    try:
+        h = hashlib.sha1()
+        with open(MODEL_PATH, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()[:8]
+    except OSError:
+        return "nomodel"
+
+
+MODEL_TAG = _model_tag()
 
 # メタ情報読み込み
 if os.path.exists(META_FILE):
@@ -108,23 +131,98 @@ if os.path.exists(META_FILE):
 else:
     metadata = {}
 
-# 音声埋め込み読み込み（壊れたファイルはpydubで修復してから読む）
-profiles = {}
-for filename in os.listdir(PROFILE_DIR):
-    if filename.endswith(".wav"):
-        filepath = os.path.join(PROFILE_DIR, filename)
-        name = filename.rsplit(".", 1)[0]
+samples = {}   # name -> {sample_id: 正規化済み埋め込み}
+profiles = {}  # name -> 全サンプルの平均（正規化済み）
+
+
+def person_dir(name: str) -> str:
+    return os.path.join(PROFILE_DIR, name)
+
+
+def new_sample_id() -> str:
+    return datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+
+
+def save_metadata():
+    with open(META_FILE, "w") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+
+def centroid(embeddings) -> np.ndarray:
+    mean = np.mean(np.stack(list(embeddings)), axis=0)
+    return mean / (np.linalg.norm(mean) + 1e-9)
+
+
+def load_sample_embedding(wav_path: str) -> np.ndarray:
+    """登録音声の埋め込みを返す。計算済みの .npy があればそれを使う"""
+    cache_path = f"{wav_path[:-4]}.{MODEL_TAG}.npy"
+    if os.path.exists(cache_path) and os.path.getmtime(cache_path) >= os.path.getmtime(wav_path):
+        return np.load(cache_path)
+    embedding = get_embedding_from_file(wav_path)
+    np.save(cache_path, embedding)
+    return embedding
+
+
+def remove_sample_files(name: str, sample_id: str):
+    """サンプルの wav と埋め込みキャッシュ（.npy）を削除する"""
+    for filename in os.listdir(person_dir(name)):
+        if filename.startswith(sample_id + "."):
+            os.remove(os.path.join(person_dir(name), filename))
+
+
+def refresh_profile(name: str):
+    """サンプルの平均からプロファイルを作り直す。サンプルが無ければ削除"""
+    if samples.get(name):
+        profiles[name] = centroid(samples[name].values())
+    else:
+        samples.pop(name, None)
+        profiles.pop(name, None)
+
+
+def migrate_legacy_profiles():
+    """旧形式 profiles/<name>.wav（1人1本）を profiles/<name>/<sample_id>.wav に移す"""
+    for filename in sorted(os.listdir(PROFILE_DIR)):
+        legacy_path = os.path.join(PROFILE_DIR, filename)
+        if not (filename.endswith(".wav") and os.path.isfile(legacy_path)):
+            continue
+        name = filename[:-4]
+        if not NAME_RE.match(name):
+            logging.warning(f"[migrate] skip '{filename}': invalid name")
+            continue
         try:
-            profiles[name] = get_embedding_from_file(filepath)
+            os.makedirs(person_dir(name), exist_ok=True)
+            mtime = datetime.fromtimestamp(os.path.getmtime(legacy_path))
+            dest = os.path.join(person_dir(name), mtime.strftime("%Y%m%d-%H%M%S-000") + ".wav")
+            # 中身が WebM などの場合もあるので pydub で本物の WAV に変換する
+            AudioSegment.from_file(legacy_path).export(dest, format="wav")
+            os.remove(legacy_path)
+            logging.info(f"[migrate] '{filename}' -> '{dest}'")
         except Exception as e:
-            logging.warning(f"[startup] Failed to load profile '{filename}': {e} — attempting conversion")
+            logging.error(f"[migrate] could not migrate '{filename}': {e}")
+
+
+def load_profiles():
+    """profiles/ から全登録者のサンプルを読み込み、プロファイルを作る"""
+    global samples, profiles
+    migrate_legacy_profiles()
+    samples, profiles = {}, {}
+    for name in sorted(os.listdir(PROFILE_DIR)):
+        if not (NAME_RE.match(name) and os.path.isdir(person_dir(name))):
+            continue
+        for filename in sorted(os.listdir(person_dir(name))):
+            if not filename.endswith(".wav"):
+                continue
             try:
-                audio_seg = AudioSegment.from_file(filepath)
-                audio_seg.export(filepath, format="wav")
-                profiles[name] = get_embedding_from_file(filepath)
-                logging.info(f"[startup] Converted and loaded '{filename}' successfully")
-            except Exception as e2:
-                logging.error(f"[startup] Could not recover '{filename}': {e2}")
+                samples.setdefault(name, {})[filename[:-4]] = \
+                    load_sample_embedding(os.path.join(person_dir(name), filename))
+            except Exception as e:
+                logging.error(f"[startup] Could not load '{name}/{filename}': {e}")
+        refresh_profile(name)
+    log(f"[startup] loaded {len(profiles)} speakers, "
+        f"{sum(len(v) for v in samples.values())} samples (model {MODEL_TAG})")
+
+
+load_profiles()
 
 @app.errorhandler(Exception)
 def handle_exception(e):
@@ -177,17 +275,14 @@ def restore():
     buf = io.BytesIO(file.read())
     with zipfile.ZipFile(buf) as zf:
         zf.extractall(PROFILE_DIR)
-    global metadata, profiles
+    global metadata
     if os.path.exists(META_FILE):
         with open(META_FILE, "r") as f:
             metadata = json.load(f)
     else:
         metadata = {}
-    profiles = {}
-    for filename in os.listdir(PROFILE_DIR):
-        if filename.endswith(".wav"):
-            name = filename.rsplit(".", 1)[0]
-            profiles[name] = get_embedding_from_file(os.path.join(PROFILE_DIR, filename))
+    # 旧形式のバックアップもここで新形式に移行される
+    load_profiles()
     return jsonify({"status": "restored"})
 
 @app.route("/register", methods=["POST"])
@@ -206,8 +301,12 @@ def register():
 
     if not name:
         return jsonify({"error": "Name is empty"}), 400
+    if not NAME_RE.match(name):
+        return jsonify({"error": "識別名は半角英数字・_・- のみ使えます"}), 400
 
-    save_path = os.path.join(PROFILE_DIR, f"{name}.wav")
+    os.makedirs(person_dir(name), exist_ok=True)
+    sample_id = new_sample_id()
+    save_path = os.path.join(person_dir(name), f"{sample_id}.wav")
 
     try:
         raw_bytes = file.read()
@@ -219,18 +318,84 @@ def register():
 
     try:
         t0 = time.time()
-        profiles[name] = get_embedding_from_file(save_path)
+        embedding = load_sample_embedding(save_path)
         print(f"[register] get_embedding took {time.time() - t0:.3f} sec")
     except Exception as e:
         logging.exception("[register] get_embedding failed")
+        os.remove(save_path)
         return jsonify({"error": str(e)}), 500
 
-    metadata[name] = {"kana": kana}
-    with open(META_FILE, "w") as f:
-        json.dump(metadata, f, ensure_ascii=False, indent=2)
+    # 既存サンプルとの一致度（低ければ録り直しの目安）
+    existing = samples.get(name, {})
+    consistency = round(float(np.dot(embedding, centroid(existing.values()))), 3) if existing else None
+
+    samples.setdefault(name, {})[sample_id] = embedding
+    refresh_profile(name)
+
+    if kana or name not in metadata:
+        metadata[name] = {"kana": kana or name}
+    save_metadata()
 
     print(f"[register] Total time: {time.time() - start_time:.3f} sec")
-    return jsonify({"status": "ok", "name": name, "kana": kana})
+    return jsonify({
+        "status": "ok",
+        "name": name,
+        "kana": metadata[name]["kana"],
+        "sample_id": sample_id,
+        "num_samples": len(samples[name]),
+        "consistency": consistency,
+    })
+
+
+@app.route("/profiles", methods=["GET"])
+def list_profiles():
+    """登録者とサンプルの一覧。各サンプルの「他のサンプルとの一致度」も返す"""
+    require_auth()
+    people = []
+    for name in sorted(samples):
+        items = []
+        for sample_id, emb in samples[name].items():
+            others = [e for sid, e in samples[name].items() if sid != sample_id]
+            items.append({
+                "id": sample_id,
+                "consistency": round(float(np.dot(emb, centroid(others))), 3) if others else None,
+            })
+        people.append({
+            "name": name,
+            "kana": metadata.get(name, {}).get("kana", name),
+            "samples": items,
+        })
+    return jsonify({"people": people})
+
+
+@app.route("/profiles/<name>", methods=["DELETE"])
+def delete_profile(name):
+    require_auth()
+    if not NAME_RE.match(name) or name not in samples:
+        return jsonify({"error": "not found"}), 404
+    shutil.rmtree(person_dir(name), ignore_errors=True)
+    samples.pop(name, None)
+    refresh_profile(name)
+    metadata.pop(name, None)
+    save_metadata()
+    return jsonify({"status": "deleted", "name": name})
+
+
+@app.route("/profiles/<name>/samples/<sample_id>", methods=["DELETE"])
+def delete_sample(name, sample_id):
+    require_auth()
+    if (not NAME_RE.match(name) or not SAMPLE_ID_RE.match(sample_id)
+            or sample_id not in samples.get(name, {})):
+        return jsonify({"error": "not found"}), 404
+    remove_sample_files(name, sample_id)
+    del samples[name][sample_id]
+    refresh_profile(name)
+    if name not in samples:
+        shutil.rmtree(person_dir(name), ignore_errors=True)
+        metadata.pop(name, None)
+        save_metadata()
+    return jsonify({"status": "deleted", "name": name, "sample_id": sample_id,
+                    "num_samples": len(samples.get(name, {}))})
 
 @app.route("/identify", methods=["POST"])
 def identify():

@@ -7,6 +7,7 @@ import io
 import os
 import sys
 import json
+import tempfile
 
 import numpy as np
 import pytest
@@ -40,6 +41,8 @@ _sf_real.read = _mock_sf_read
 # 必須環境変数を設定してからインポート
 os.environ.setdefault("SPEAKERID_API_KEY", "test-secret-token-for-pytest")
 os.environ.setdefault("SPEAKER_MODEL_PATH", "/tmp/dummy.onnx")
+# 本物の profiles/ を移行・変更しないよう、テスト用の一時ディレクトリを使う
+os.environ["SPEAKER_PROFILE_DIR"] = tempfile.mkdtemp(prefix="speaker-id-test-")
 
 import app as app_module  # noqa: E402
 
@@ -60,6 +63,26 @@ def client():
     app_module.app.config["TESTING"] = True
     with app_module.app.test_client() as c:
         yield c
+
+
+@pytest.fixture
+def isolated_profiles(tmp_path, monkeypatch):
+    """空の profiles ディレクトリで登録系をテストする"""
+    monkeypatch.setattr(app_module, "PROFILE_DIR", str(tmp_path))
+    monkeypatch.setattr(app_module, "META_FILE", str(tmp_path / "metadata.json"))
+    monkeypatch.setattr(app_module, "metadata", {})
+    monkeypatch.setattr(app_module, "samples", {})
+    monkeypatch.setattr(app_module, "profiles", {})
+    return tmp_path
+
+
+def _register(client, name, kana=""):
+    return client.post(
+        "/register",
+        headers=AUTH,
+        data={"name": name, "kana": kana, "audio": (_make_wav(), "a.wav", "audio/wav")},
+        content_type="multipart/form-data",
+    )
 
 
 def _make_wav(duration_samples: int = 16000) -> io.BytesIO:
@@ -182,13 +205,8 @@ class TestRegister:
         )
         assert resp.status_code == 400
 
-    def test_register_success(self, client, tmp_path, monkeypatch):
+    def test_register_success(self, client, isolated_profiles):
         """正常な WAV と name で登録成功"""
-        monkeypatch.setattr(app_module, "PROFILE_DIR", str(tmp_path))
-        monkeypatch.setattr(app_module, "META_FILE", str(tmp_path / "metadata.json"))
-        monkeypatch.setattr(app_module, "metadata", {})
-        monkeypatch.setattr(app_module, "profiles", {})
-
         buf = _make_wav()
         resp = client.post(
             "/register",
@@ -205,6 +223,101 @@ class TestRegister:
         assert data["status"] == "ok"
         assert data["name"] == "alice"
         assert data["kana"] == "アリス"
+        assert data["num_samples"] == 1
+        assert data["consistency"] is None
+
+    def test_register_appends_samples(self, client, isolated_profiles):
+        """同じ名前で登録するとサンプルが追加され、一致度が返る"""
+        _register(client, "alice", "アリス")
+        data = _register(client, "alice").get_json()
+        assert data["num_samples"] == 2
+        assert data["consistency"] == pytest.approx(1.0)
+        assert data["kana"] == "アリス"  # kana 省略時は既存の表示名を保つ
+        assert len(list((isolated_profiles / "alice").glob("*.wav"))) == 2
+        assert len(app_module.samples["alice"]) == 2
+        assert np.isclose(np.linalg.norm(app_module.profiles["alice"]), 1.0)
+
+    @pytest.mark.parametrize("name", ["../evil", "a/b", "田中", "a b"])
+    def test_register_rejects_invalid_name(self, client, isolated_profiles, name):
+        """パスに使えない識別名は 400"""
+        assert _register(client, name).status_code == 400
+
+
+# -----------------------------------------------------------------------
+# /profiles エンドポイントテスト
+# -----------------------------------------------------------------------
+class TestProfiles:
+    def test_requires_auth(self, client):
+        assert client.get("/profiles").status_code == 401
+        assert client.delete("/profiles/alice").status_code == 401
+
+    def test_list_profiles(self, client, isolated_profiles):
+        """登録者ごとにサンプル一覧と一致度が返る"""
+        _register(client, "alice", "アリス")
+        _register(client, "alice")
+        people = client.get("/profiles", headers=AUTH).get_json()["people"]
+        assert [p["name"] for p in people] == ["alice"]
+        assert people[0]["kana"] == "アリス"
+        assert len(people[0]["samples"]) == 2
+        assert people[0]["samples"][0]["consistency"] == pytest.approx(1.0)
+
+    def test_delete_sample(self, client, isolated_profiles):
+        """サンプルを1つ削除すると残りでプロファイルが作り直される"""
+        first = _register(client, "alice").get_json()["sample_id"]
+        _register(client, "alice")
+        resp = client.delete(f"/profiles/alice/samples/{first}", headers=AUTH)
+        assert resp.status_code == 200
+        assert resp.get_json()["num_samples"] == 1
+        assert first not in app_module.samples["alice"]
+        assert not list((isolated_profiles / "alice").glob(f"{first}*"))
+
+    def test_delete_last_sample_removes_person(self, client, isolated_profiles):
+        sample_id = _register(client, "alice").get_json()["sample_id"]
+        client.delete(f"/profiles/alice/samples/{sample_id}", headers=AUTH)
+        assert "alice" not in app_module.profiles
+        assert "alice" not in app_module.metadata
+        assert not (isolated_profiles / "alice").exists()
+
+    def test_delete_profile(self, client, isolated_profiles):
+        _register(client, "alice")
+        assert client.delete("/profiles/alice", headers=AUTH).status_code == 200
+        assert "alice" not in app_module.profiles
+        assert not (isolated_profiles / "alice").exists()
+        assert client.delete("/profiles/alice", headers=AUTH).status_code == 404
+
+    def test_delete_sample_rejects_bad_id(self, client, isolated_profiles):
+        _register(client, "alice")
+        resp = client.delete("/profiles/alice/samples/..%2Fmetadata", headers=AUTH)
+        assert resp.status_code == 404
+
+
+# -----------------------------------------------------------------------
+# 起動時の読み込み・旧形式からの移行
+# -----------------------------------------------------------------------
+class TestLoadProfiles:
+    def test_migrates_legacy_wav(self, isolated_profiles):
+        """profiles/<name>.wav は profiles/<name>/<id>.wav に移行される"""
+        import soundfile as sf
+        sf.write(isolated_profiles / "bob.wav", np.random.rand(16000).astype(np.float32), 16000)
+        app_module.load_profiles()
+        assert not (isolated_profiles / "bob.wav").exists()
+        assert len(list((isolated_profiles / "bob").glob("*.wav"))) == 1
+        assert "bob" in app_module.profiles
+
+    def test_embedding_cache_is_used(self, isolated_profiles, monkeypatch):
+        """2回目の読み込みでは .npy キャッシュを使い、埋め込みを再計算しない"""
+        import soundfile as sf
+        (isolated_profiles / "carol").mkdir()
+        sf.write(isolated_profiles / "carol" / "20260101-000000-000.wav",
+                 np.random.rand(16000).astype(np.float32), 16000)
+        app_module.load_profiles()
+        assert list((isolated_profiles / "carol").glob(f"*.{app_module.MODEL_TAG}.npy"))
+
+        def fail(*args, **kwargs):
+            raise AssertionError("cache not used")
+        monkeypatch.setattr(app_module, "get_embedding_from_file", fail)
+        app_module.load_profiles()
+        assert "carol" in app_module.profiles
 
 
 # -----------------------------------------------------------------------

@@ -8,6 +8,12 @@
     h1 { color: #333; }
     label, input, button { display: block; margin: 1em 0; }
     #status { margin-top: 1em; font-weight: bold; }
+    .hint { color: #555; font-size: 0.9em; }
+    #profileList { border-collapse: collapse; margin: 0.5em 0 1.5em; background: #fff; }
+    #profileList th, #profileList td { border-bottom: 1px solid #ddd; padding: 4px 10px; text-align: left; }
+    #profileList td.num { text-align: right; font-variant-numeric: tabular-nums; }
+    #profileList button { display: inline; margin: 0; }
+    .low { color: #c8312f; font-weight: bold; }
   </style>
 </head>
 <body>
@@ -28,6 +34,11 @@
   <button id="uploadButton" disabled>⬆️ 登録して送信</button>
 
   <p id="status">状態: 待機中</p>
+  <p class="hint">同じ識別名で何回か登録すると、録音が追加されて精度が上がります（3〜5回、できれば日や時間帯を変えて）。</p>
+
+  <h2>登録済みの話者</h2>
+  <p class="hint">一致度は、その録音が同じ人の他の録音とどれだけ似ているかです。極端に低い録音（0.5未満）は、雑音や別人の声が入っている可能性があるので削除をおすすめします。</p>
+  <div id="profiles">読み込み中...</div>
 
   <a href="/test.html">→ 話者識別テストへ</a>
 
@@ -48,8 +59,62 @@
 
     // --- 認証（auth.js） ---
     window.onload = function () {
-      Auth.ensureToken();
+      Auth.ensureToken(loadProfiles);
     };
+
+    const fmtId = (id) => id.replace(/^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2}).*$/, "$1-$2-$3 $4:$5:$6");
+
+    async function loadProfiles() {
+      const box = document.getElementById("profiles");
+      const res = await Auth.authFetch("/profiles");
+      if (!res.ok) { box.textContent = "一覧を取得できませんでした"; return; }
+      const { people } = await res.json();
+      if (people.length === 0) { box.textContent = "まだ登録されていません"; return; }
+
+      const table = document.createElement("table");
+      table.id = "profileList";
+      table.innerHTML = "<thead><tr><th>話者</th><th>録音日時</th><th>一致度</th><th></th></tr></thead>";
+      const tbody = document.createElement("tbody");
+      for (const p of people) {
+        p.samples.forEach((sample, i) => {
+          const tr = document.createElement("tr");
+          const who = document.createElement("td");
+          if (i === 0) {
+            who.rowSpan = p.samples.length;
+            who.textContent = `${p.kana}（${p.name}）・${p.samples.length}件 `;
+            const delAll = document.createElement("button");
+            delAll.textContent = "全削除";
+            delAll.onclick = () => remove(`/profiles/${encodeURIComponent(p.name)}`,
+              `${p.kana} さんの登録をすべて削除しますか？`);
+            who.appendChild(delAll);
+            tr.appendChild(who);
+          }
+          const when = document.createElement("td");
+          when.textContent = fmtId(sample.id);
+          const score = document.createElement("td");
+          score.className = "num" + (sample.consistency !== null && sample.consistency < 0.5 ? " low" : "");
+          score.textContent = sample.consistency === null ? "–" : sample.consistency.toFixed(3);
+          const action = document.createElement("td");
+          const del = document.createElement("button");
+          del.textContent = "削除";
+          del.onclick = () => remove(
+            `/profiles/${encodeURIComponent(p.name)}/samples/${encodeURIComponent(sample.id)}`,
+            `${fmtId(sample.id)} の録音を削除しますか？`);
+          action.appendChild(del);
+          tr.append(when, score, action);
+          tbody.appendChild(tr);
+        });
+      }
+      table.appendChild(tbody);
+      box.replaceChildren(table);
+    }
+
+    async function remove(url, message) {
+      if (!confirm(message)) return;
+      const res = await Auth.authFetch(url, { method: "DELETE" });
+      if (!res.ok) alert(`削除に失敗しました (HTTP ${res.status})`);
+      loadProfiles();
+    }
 
     document.getElementById("logoutBtn").onclick = function() {
       Auth.logout();
@@ -112,7 +177,13 @@
         });
         const result = await res.json();
         if (res.ok) {
-          status.textContent = `登録成功: ${result.kana}（ID: ${result.name}）`;
+          let msg = `登録成功: ${result.kana}（ID: ${result.name}）・${result.num_samples}件目`;
+          if (result.consistency !== null) {
+            msg += `、既存の録音との一致度 ${result.consistency.toFixed(3)}`;
+            if (result.consistency < 0.5) msg += "（低め：録り直しを検討してください）";
+          }
+          status.textContent = msg;
+          loadProfiles();
         } else {
           status.textContent = `エラー (HTTP ${res.status}): ${result.error || JSON.stringify(result)}`;
         }
