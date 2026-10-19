@@ -22,19 +22,39 @@
 
     <section class="card">
       <h2>声を登録する</h2>
-      <p class="card-sub">同じ識別名で何回か登録すると、録音が追加されて精度が上がります（3〜5回、できれば日や時間帯を変えて）。</p>
+      <p class="card-sub">1人につき3〜5回録音すると精度が上がります（できれば日や時間帯を変えて）。</p>
 
-      <div class="field">
-        <label for="nameInput">識別名（半角英数字）</label>
-        <input type="text" id="nameInput" placeholder="例: tanaka">
-      </div>
-      <div class="field">
-        <label for="kanaInput">表示名（ひらがなや漢字など）</label>
-        <input type="text" id="kanaInput" placeholder="例: たなかさん">
+      <div class="segmented" role="radiogroup" aria-label="登録のしかた">
+        <label><input type="radio" name="mode" value="add" id="modeAdd"> 登録済みの人に追加</label>
+        <label><input type="radio" name="mode" value="new" id="modeNew"> 新しい人を登録</label>
       </div>
 
-      <p class="hint">以下の文を読み上げてください（声の部分が3秒以上必要です。静かな場所でマイクに近づいて）</p>
-      <p id="sampleText" class="read-aloud">こんにちは。私は〇〇です。スタックチャンに声を登録します。よろしくお願いします。</p>
+      <div id="addFields">
+        <div class="field">
+          <label for="personSelect">録音を追加する人</label>
+          <select id="personSelect"></select>
+        </div>
+      </div>
+
+      <div id="newFields" hidden>
+        <div class="field">
+          <label for="nameInput">識別名（半角英数字）</label>
+          <input type="text" id="nameInput" placeholder="例: tanaka">
+        </div>
+        <div class="field">
+          <label for="kanaInput">表示名（ひらがなや漢字など）</label>
+          <input type="text" id="kanaInput" placeholder="例: たなかさん">
+        </div>
+      </div>
+
+      <p class="hint">以下の文を、スタックチャンに話しかけるくらいの自然な声で読んでください。録音ごとに違う文が出ます（静かな場所で、普段使うときと同じくらいの距離から）。</p>
+      <div class="read-aloud">
+        <div class="read-aloud-head">
+          <span id="sampleLabel"></span>
+          <button type="button" id="nextTextBtn" class="btn btn-ghost btn-small">↻ 別の文にする</button>
+        </div>
+        <p id="sampleText"></p>
+      </div>
 
       <div class="actions">
         <button id="recordButton" class="btn">🎙️ 録音開始</button>
@@ -74,13 +94,77 @@
       Auth.ensureToken(loadProfiles);
     };
 
+    // --- 登録のしかた（登録済みの人に追加 / 新しい人を登録） ---
+    const modeAdd = document.getElementById("modeAdd");
+    const modeNew = document.getElementById("modeNew");
+    const personSelect = document.getElementById("personSelect");
+    let people = [];
+    let modeChosen = false;  // 初回読み込み時だけ既定のモードを決める
+
+    function setMode(mode, name) {
+      modeChosen = true;
+      (mode === "add" ? modeAdd : modeNew).checked = true;
+      document.getElementById("addFields").hidden = mode !== "add";
+      document.getElementById("newFields").hidden = mode !== "new";
+      if (name) personSelect.value = name;
+      chooseText();
+    }
+    modeAdd.onchange = () => setMode("add");
+    modeNew.onchange = () => setMode("new");
+    personSelect.onchange = () => chooseText();
+
+    // --- 音読用の文 ---
+    // 話す内容によらず声の特徴を見るモデルなので、いろいろな音（長音・撥音・促音・拗音・
+    // 摩擦音など）と抑揚（問いかけ・呼びかけ・数字）を含む文を録音ごとに変えて読んでもらう
+    const READ_TEXTS = [
+      { label: "自己紹介", text: "こんにちは。私は〇〇です。スタックチャンに声を登録します。毎日話しかけるので、ちゃんと覚えてくださいね。" },
+      { label: "問いかけ", text: "ねえ、スタックチャン。今日の天気はどう？ 午後から雨が降りそうなら、傘を持っていったほうがいいかな。" },
+      { label: "ゆったり", text: "青い海と白い雲を眺めながら、冷たい麦茶をゆっくり飲みました。風が気持ちよくて、思わず大きな声で笑いました。" },
+      { label: "小さい「っ」「ゃゅょ」", text: "明日の朝は、駅前の喫茶店でちょっと早めに待ち合わせしましょう。しっかり準備して、きっと楽しい旅行にしようね。" },
+      { label: "数字", text: "目覚ましを六時四十五分にセットして。それから、三百二十八円の牛乳と、パンを二つ買うのを忘れないように教えてね。" },
+      { label: "は行・ら行", text: "ふわふわのパンケーキに、はちみつとバターをたっぷりかけて、リビングでラジオを聞きながら、みんなで食べました。" },
+      { label: "呼びかけ", text: "おーい、聞こえる？ 部屋の電気をつけて、音楽を少しだけ小さくしてくれる？ ありがとう、とても助かったよ！" },
+      { label: "朗読", text: "むかしむかし、ある山のふもとに、やさしいおじいさんとおばあさんが、小さな犬と一緒に静かに暮らしていました。" },
+    ];
+    let textIndex = 0;
+
+    function showText(i) {
+      textIndex = (i + READ_TEXTS.length) % READ_TEXTS.length;
+      const t = READ_TEXTS[textIndex];
+      document.getElementById("sampleLabel").textContent = `文 ${textIndex + 1} / ${READ_TEXTS.length}・${t.label}`;
+      document.getElementById("sampleText").textContent = t.text;
+    }
+
+    // 追加のときは、その人の登録件数に応じて次の文を出す（同じ文ばかりにならないように）
+    function chooseText() {
+      const person = modeAdd.checked && people.find((p) => p.name === personSelect.value);
+      showText(person ? person.samples.length : 0);
+    }
+    document.getElementById("nextTextBtn").onclick = () => showText(textIndex + 1);
+
+    function updatePersonSelect() {
+      const current = personSelect.value;
+      personSelect.replaceChildren(...people.map((p) => {
+        const opt = document.createElement("option");
+        opt.value = p.name;
+        opt.textContent = `${p.kana}（${p.name}）・${p.samples.length}件`;
+        return opt;
+      }));
+      if (people.some((p) => p.name === current)) personSelect.value = current;
+      modeAdd.disabled = people.length === 0;
+      if (people.length === 0) setMode("new");
+      else if (!modeChosen) setMode("add");
+      else chooseText();
+    }
+
     const fmtId = (id) => id.replace(/^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2}).*$/, "$1-$2-$3 $4:$5:$6");
 
     async function loadProfiles() {
       const box = document.getElementById("profiles");
       const res = await Auth.authFetch("/profiles");
       if (!res.ok) { box.textContent = "一覧を取得できませんでした"; return; }
-      const { people } = await res.json();
+      ({ people } = await res.json());
+      updatePersonSelect();
       if (people.length === 0) { box.textContent = "まだ登録されていません"; return; }
       box.className = "table-wrap";
 
@@ -100,8 +184,19 @@
             delAll.className = "btn btn-small";
             delAll.textContent = "全削除";
             delAll.onclick = () => remove(`/profiles/${encodeURIComponent(p.name)}`,
-              `${p.kana} さんの登録をすべて削除しますか？`);
-            who.appendChild(delAll);
+              `${p.kana}（${p.name}）の登録をすべて削除しますか？`);
+            const addMore = document.createElement("button");
+            addMore.className = "btn btn-small";
+            addMore.textContent = "＋録音を追加";
+            addMore.onclick = () => {
+              setMode("add", p.name);
+              setStatus(`${p.kana}（${p.name}）の録音を追加します。「録音開始」を押してください`);
+              document.querySelector(".card").scrollIntoView({ behavior: "smooth" });
+            };
+            const buttons = document.createElement("div");
+            buttons.className = "row-actions";
+            buttons.append(addMore, delAll);
+            who.appendChild(buttons);
             tr.appendChild(who);
           }
           const when = document.createElement("td");
@@ -170,11 +265,18 @@
     };
 
     uploadBtn.onclick = async () => {
-      const name = document.getElementById("nameInput").value.trim();
-      const kana = document.getElementById("kanaInput").value.trim();
+      const mode = modeAdd.checked ? "add" : "new";
+      const name = mode === "add"
+        ? personSelect.value
+        : document.getElementById("nameInput").value.trim();
+      const kana = mode === "add" ? "" : document.getElementById("kanaInput").value.trim();
 
       if (!name) {
-        alert("識別名を入力してください");
+        setStatus(mode === "add" ? "録音を追加する人を選んでください" : "識別名を入力してください", "error");
+        return;
+      }
+      if (mode === "new" && people.some((p) => p.name === name)) {
+        setStatus(`識別名「${name}」はすでに登録されています。この人に録音を足す場合は「登録済みの人に追加」を選んでください`, "error");
         return;
       }
 
@@ -183,6 +285,7 @@
       formData.append("audio", blob, name + ".wav");
       formData.append("name", name);
       formData.append("kana", kana);
+      formData.append("mode", mode);
 
       setStatus("送信中...");
       try {
@@ -198,7 +301,14 @@
             if (result.consistency < 0.5) msg += "（低め：録り直しを検討してください）";
           }
           setStatus(msg, result.consistency !== null && result.consistency < 0.5 ? "error" : "ok");
-          loadProfiles();
+          await loadProfiles();
+          if (mode === "new") {
+            // 続けて同じ人の 2 本目以降を録れるように「追加」に切り替える
+            document.getElementById("nameInput").value = "";
+            document.getElementById("kanaInput").value = "";
+            setMode("add", name);
+          }
+          uploadBtn.disabled = true;
         } else {
           setStatus(`エラー (HTTP ${res.status}): ${result.error || JSON.stringify(result)}`, "error");
         }

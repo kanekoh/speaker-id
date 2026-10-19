@@ -76,13 +76,12 @@ def isolated_profiles(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _register(client, name, kana=""):
-    return client.post(
-        "/register",
-        headers=AUTH,
-        data={"name": name, "kana": kana, "audio": (_make_wav(), "a.wav", "audio/wav")},
-        content_type="multipart/form-data",
-    )
+def _register(client, name, kana="", mode=None):
+    data = {"name": name, "kana": kana, "audio": (_make_wav(), "a.wav", "audio/wav")}
+    if mode:
+        data["mode"] = mode
+    return client.post("/register", headers=AUTH, data=data,
+                       content_type="multipart/form-data")
 
 
 def _make_speech_wav(speech_sec: float, silence_sec: float) -> io.BytesIO:
@@ -262,6 +261,28 @@ class TestRegister:
         assert resp.get_json()["speech_sec"] < app_module.MIN_REGISTER_SEC
         assert "alice" not in app_module.profiles
         assert not list(isolated_profiles.glob("alice/*.wav"))
+
+    def test_register_mode_new_rejects_existing_name(self, client, isolated_profiles):
+        """mode=new で既存の識別名を指定すると 409 で、録音は増えない"""
+        _register(client, "alice")
+        resp = _register(client, "alice", mode="new")
+        assert resp.status_code == 409
+        assert len(app_module.samples["alice"]) == 1
+        assert len(list((isolated_profiles / "alice").glob("*.wav"))) == 1
+
+    def test_register_mode_add_rejects_unknown_name(self, client, isolated_profiles):
+        """mode=add で未登録の識別名を指定すると 404 で、新しい人は作られない"""
+        _register(client, "alice")
+        resp = _register(client, "alicee", mode="add")
+        assert resp.status_code == 404
+        assert "alicee" not in app_module.samples
+        assert not (isolated_profiles / "alicee").exists()
+
+    def test_register_modes_success(self, client, isolated_profiles):
+        """mode=new で新規登録、mode=add で追加できる"""
+        assert _register(client, "alice", mode="new").status_code == 200
+        data = _register(client, "alice", mode="add").get_json()
+        assert data["num_samples"] == 2
 
     @pytest.mark.parametrize("name", ["../evil", "a/b", "田中", "a b"])
     def test_register_rejects_invalid_name(self, client, isolated_profiles, name):

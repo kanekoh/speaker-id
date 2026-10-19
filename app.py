@@ -352,6 +352,14 @@ def register():
         return jsonify({"error": "Name is empty"}), 400
     if not NAME_RE.match(name):
         return jsonify({"error": "識別名は半角英数字・_・- のみ使えます"}), 400
+    # 打ち間違いで別人として登録したり、他人の録音に混ぜたりしないための確認
+    # mode を省略した場合は従来どおり（あれば追加、なければ新規）
+    mode = request.form.get("mode", "")
+    if mode == "new" and name in samples:
+        return jsonify({"error": f"識別名「{name}」はすでに登録されています。"
+                                 "この人に録音を足す場合は「登録済みの人に追加」を選んでください"}), 409
+    if mode == "add" and name not in samples:
+        return jsonify({"error": f"識別名「{name}」は登録されていません"}), 404
 
     os.makedirs(person_dir(name), exist_ok=True)
     sample_id = new_sample_id()

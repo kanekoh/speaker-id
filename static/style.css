@@ -111,7 +111,7 @@ a { color: var(--accent); }
 /* ---- フォーム ---- */
 .field { display: flex; flex-direction: column; gap: 4px; margin: 0 0 12px; max-width: 360px; }
 .field label { font-size: 0.9em; color: var(--text-secondary); }
-input[type="text"], input[type="password"] {
+input[type="text"], input[type="password"], select {
   font: inherit; color: var(--text-primary);
   background: var(--surface-1);
   border: 1px solid var(--border); border-radius: 6px;
@@ -135,12 +135,31 @@ input:focus-visible, button:focus-visible, a:focus-visible {
 .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
 .btn-ghost { border-color: transparent; background: transparent; color: var(--text-secondary); }
 .btn-small { padding: 2px 10px; font-size: 0.85em; }
+.segmented {
+  display: inline-flex; flex-wrap: wrap; margin: 0 0 12px;
+  border: 1px solid var(--border); border-radius: 6px; overflow: hidden;
+}
+.segmented label {
+  padding: 6px 14px; cursor: pointer; font-size: 0.95em;
+  color: var(--text-secondary); background: var(--surface-1);
+}
+.segmented label + label { border-left: 1px solid var(--border); }
+.segmented input { position: absolute; opacity: 0; pointer-events: none; }
+.segmented label:has(input:checked) { background: var(--accent); color: var(--accent-text); }
+.segmented label:has(input:disabled) { opacity: 0.45; cursor: not-allowed; }
+.segmented label:has(input:focus-visible) { outline: 2px solid var(--focus); outline-offset: -2px; }
+.row-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
 .check { display: inline-flex; align-items: center; gap: 6px; font-size: 0.9em; color: var(--text-secondary); }
 
 .read-aloud {
   background: var(--surface-2); border-radius: 6px;
-  padding: 10px 14px; margin: 8px 0 12px;
+  padding: 8px 14px 10px; margin: 8px 0 12px;
 }
+.read-aloud-head {
+  display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  font-size: 0.8em; color: var(--text-secondary);
+}
+.read-aloud p { margin: 4px 0 0; font-size: 1.1em; line-height: 1.8; }
 
 .status { font-weight: bold; margin: 8px 0 0; }
 .status.is-recording { color: var(--critical); }
