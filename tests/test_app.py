@@ -19,7 +19,7 @@ from unittest.mock import MagicMock
 _mock_stream = MagicMock()
 _mock_extractor = MagicMock()
 _mock_extractor.create_stream.return_value = _mock_stream
-_mock_extractor.get.return_value = np.ones(192, dtype=np.float32).tolist()
+_mock_extractor.compute.return_value = np.ones(192, dtype=np.float32).tolist()
 _mock_sherpa = MagicMock()
 _mock_sherpa.SpeakerEmbeddingExtractor.return_value = _mock_extractor
 _mock_sherpa.SpeakerEmbeddingExtractorConfig.return_value = MagicMock()
@@ -253,6 +253,28 @@ class TestIdentify:
         assert data["kana"] == "アリス"
         assert "score" in data
 
+    def test_identify_below_threshold_returns_none(self, client, monkeypatch):
+        """最高スコアが閾値未満なら name=null と候補者が返る"""
+        # モックの埋め込み(ones)と直交するベクトル → コサイン類似度 0
+        vec = np.zeros(192, dtype=np.float32)
+        vec[0], vec[1] = 1.0, -1.0
+        vec /= np.linalg.norm(vec)
+        monkeypatch.setattr(app_module, "profiles", {"dave": vec})
+        monkeypatch.setattr(app_module, "metadata", {"dave": {"kana": "デイブ"}})
+
+        buf = _make_wav()
+        resp = client.post(
+            "/identify",
+            headers=AUTH,
+            data={"audio": (buf, "query.wav", "audio/wav")},
+            content_type="multipart/form-data",
+        )
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["name"] is None
+        assert data["kana"] is None
+        assert data["candidate"] == "dave"
+
     def test_identify_response_schema(self, client, monkeypatch):
         """レスポンスに name / kana / score キーが含まれる"""
         monkeypatch.setattr(app_module, "profiles", {"carol": np.ones(192, dtype=np.float32)})
@@ -267,6 +289,17 @@ class TestIdentify:
         )
         data = resp.get_json()
         assert set(data.keys()) >= {"name", "kana", "score"}
+
+
+# -----------------------------------------------------------------------
+# 埋め込み抽出テスト
+# -----------------------------------------------------------------------
+class TestEmbedding:
+    def test_embedding_is_l2_normalized(self):
+        """埋め込みは L2 ノルム 1 に正規化されている"""
+        audio = np.random.rand(16000).astype(np.float32)
+        emb = app_module.get_embedding_from_array(audio, 16000)
+        assert np.isclose(np.linalg.norm(emb), 1.0, atol=1e-5)
 
 
 # -----------------------------------------------------------------------

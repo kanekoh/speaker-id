@@ -11,6 +11,7 @@ import sys
 import zipfile
 import io
 from pydub import AudioSegment
+from werkzeug.exceptions import HTTPException
 
 
 logging.basicConfig(
@@ -29,6 +30,8 @@ app.logger.propagate = True
 # 話者識別モデルの初期化
 MODEL_PATH = os.getenv("SPEAKER_MODEL_PATH", "/app/model/model.onnx")
 SAMPLE_RATE = 16000
+# コサイン類似度がこの値未満なら「該当者なし」とする（実データで調整すること）
+SCORE_THRESHOLD = float(os.getenv("SPEAKER_SCORE_THRESHOLD", "0.5"))
 
 extractor_config = sherpa_onnx.SpeakerEmbeddingExtractorConfig(
     model=MODEL_PATH,
@@ -79,7 +82,9 @@ def get_embedding_from_array(audio: np.ndarray, sr: int) -> np.ndarray:
     stream = extractor.create_stream()
     stream.accept_waveform(SAMPLE_RATE, audio)
     stream.input_finished()
-    return np.array(extractor.compute(stream))
+    embedding = np.array(extractor.compute(stream), dtype=np.float32)
+    # sherpa-onnx の埋め込みは未正規化なので、内積=コサイン類似度になるよう L2 正規化する
+    return embedding / (np.linalg.norm(embedding) + 1e-9)
 
 def get_embedding_from_file(filepath: str) -> np.ndarray:
     """WAVファイルから話者埋め込みベクトルを抽出する"""
@@ -118,6 +123,9 @@ for filename in os.listdir(PROFILE_DIR):
 
 @app.errorhandler(Exception)
 def handle_exception(e):
+    # abort(401) などの HTTP 例外はそのままのステータスで返す
+    if isinstance(e, HTTPException):
+        return e
     print(f"[unhandled exception] {type(e).__name__}: {e}", flush=True)
     logging.exception(f"[unhandled] {e}")
     return jsonify({"error": str(e)}), 500
@@ -246,9 +254,18 @@ def identify():
             best_name = name
     log(f"[identify] similarity search took {time.time() - t0:.3f} sec")
 
-    kana = metadata.get(best_name, {}).get("kana", best_name)
-
+    log(f"[identify] best={best_name} score={best_score:.3f} threshold={SCORE_THRESHOLD}")
     log(f"[identify] Total time: {time.time() - start_time:.3f} sec")
+
+    if best_name is None or best_score < SCORE_THRESHOLD:
+        return jsonify({
+            "name": None,
+            "kana": None,
+            "score": round(best_score, 3),
+            "candidate": best_name,
+        })
+
+    kana = metadata.get(best_name, {}).get("kana", best_name)
     return jsonify({
         "name": best_name,
         "kana": kana,

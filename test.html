@@ -81,7 +81,9 @@
         if (data.name) {
           result.textContent = `認識された人: ${data.kana}（スコア: ${data.score}）`;
         } else {
-          result.textContent = `識別できませんでした`;
+          result.textContent = data.candidate
+            ? `識別できませんでした（最有力: ${data.candidate}、スコア: ${data.score}）`
+            : `識別できませんでした`;
         }
       } catch (e) {
         console.error(e);
