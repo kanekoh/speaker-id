@@ -3,4 +3,3 @@ soundfile
 flask
 numpy
 scipy
-pydub

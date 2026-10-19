@@ -1,5 +1,7 @@
 import os
 import re
+import math
+import subprocess
 import hashlib
 import shutil
 from flask import Flask, request, jsonify, send_from_directory, abort, send_file
@@ -15,7 +17,6 @@ import zipfile
 import io
 from collections import deque
 from datetime import datetime
-from pydub import AudioSegment
 from werkzeug.exceptions import HTTPException
 
 
@@ -41,9 +42,12 @@ SCORE_THRESHOLD = float(os.getenv("SPEAKER_SCORE_THRESHOLD", "0.5"))
 # 識別結果の履歴（スコア確認用、メモリ上のみで再起動すると消える）
 identify_log = deque(maxlen=int(os.getenv("IDENTIFY_LOG_SIZE", "200")))
 
+# 埋め込み計算のスレッド数（ラズパイ 4/5 は 4 コア）
+NUM_THREADS = int(os.getenv("SPEAKER_NUM_THREADS", str(min(4, os.cpu_count() or 1))))
+
 extractor_config = sherpa_onnx.SpeakerEmbeddingExtractorConfig(
     model=MODEL_PATH,
-    num_threads=2,
+    num_threads=NUM_THREADS,
 )
 extractor = sherpa_onnx.SpeakerEmbeddingExtractor(extractor_config)
 
@@ -75,17 +79,28 @@ SILENCE_RANGE_DB = 30.0     # 最も大きいフレームからこれ以上小�
 SPEECH_PAD_FRAMES = 5       # 声の前後に残す余白（フレーム数、5 × 30ms = 150ms）
 MIN_REGISTER_SEC = float(os.getenv("SPEAKER_MIN_REGISTER_SEC", "3.0"))
 MIN_IDENTIFY_SEC = float(os.getenv("SPEAKER_MIN_IDENTIFY_SEC", "1.0"))
+# 識別に使う声の最大長（埋め込みの計算時間は長さに比例するため。0 で無制限）
+MAX_IDENTIFY_SEC = float(os.getenv("SPEAKER_MAX_IDENTIFY_SEC", "6.0"))
 # 前処理を変えたら上げる（保存済みの埋め込みキャッシュを作り直させるため）
 PREPROCESS_VERSION = "vad1"
 
 
 def decode_audio_bytes(audio_bytes: bytes):
-    """任意フォーマット（webm/ogg/wav等）の音声バイト列を (波形, サンプルレート) にする"""
-    audio_seg = AudioSegment.from_file(io.BytesIO(audio_bytes))
-    wav_buf = io.BytesIO()
-    audio_seg.export(wav_buf, format="wav")
-    wav_buf.seek(0)
-    return sf.read(wav_buf, dtype='float32')
+    """任意フォーマット（wav/webm/ogg等）の音声バイト列を (波形, サンプルレート) にする"""
+    # WAV など libsndfile が読める形式は直接読む（ffmpeg の起動は重いので避ける）
+    try:
+        return sf.read(io.BytesIO(audio_bytes), dtype="float32")
+    except Exception:
+        pass
+    # Chrome の MediaRecorder（WebM/Opus）などは ffmpeg で 16kHz モノラルに一度で変換する
+    result = subprocess.run(
+        ["ffmpeg", "-nostdin", "-loglevel", "error", "-i", "pipe:0",
+         "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", "pipe:1"],
+        input=audio_bytes, capture_output=True,
+    )
+    if result.returncode != 0 or not result.stdout:
+        raise ValueError(f"音声を読み込めません: {result.stderr.decode(errors='replace').strip()[-200:]}")
+    return np.frombuffer(result.stdout, dtype=np.float32).copy(), SAMPLE_RATE
 
 
 def trim_silence(audio: np.ndarray) -> np.ndarray:
@@ -109,8 +124,9 @@ def preprocess(audio: np.ndarray, sr: int) -> np.ndarray:
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
     if sr != SAMPLE_RATE:
-        num_samples = int(len(audio) * SAMPLE_RATE / sr)
-        audio = scipy_signal.resample(audio, num_samples)
+        # FFT 方式（resample）は長さによって極端に遅くなるので、多相フィルタ方式を使う
+        g = math.gcd(SAMPLE_RATE, sr)
+        audio = scipy_signal.resample_poly(audio, SAMPLE_RATE // g, sr // g)
     return trim_silence(audio.astype(np.float32))
 
 
@@ -238,8 +254,10 @@ def migrate_legacy_profiles():
             os.makedirs(person_dir(name), exist_ok=True)
             mtime = datetime.fromtimestamp(os.path.getmtime(legacy_path))
             dest = os.path.join(person_dir(name), mtime.strftime("%Y%m%d-%H%M%S-000") + ".wav")
-            # 中身が WebM などの場合もあるので pydub で本物の WAV に変換する
-            AudioSegment.from_file(legacy_path).export(dest, format="wav")
+            # 中身が WebM などの場合もあるので本物の WAV に変換する
+            with open(legacy_path, "rb") as f:
+                audio, sr = decode_audio_bytes(f.read())
+            sf.write(dest, audio, sr)
             os.remove(legacy_path)
             logging.info(f"[migrate] '{filename}' -> '{dest}'")
         except Exception as e:
@@ -272,6 +290,11 @@ def load_profiles():
 
 
 load_profiles()
+
+# 初回の識別だけ遅くならないよう、起動時に一度推論しておく
+_t = time.perf_counter()
+embed(np.random.default_rng(0).standard_normal(SAMPLE_RATE).astype(np.float32) * 0.1)
+log(f"[startup] warmup took {time.perf_counter() - _t:.3f} sec (threads={NUM_THREADS})")
 
 @app.errorhandler(Exception)
 def handle_exception(e):
@@ -339,7 +362,7 @@ def register():
     print("[register] ---- request received ----", flush=True)
     require_auth()
     print("[register] auth passed", flush=True)
-    start_time = time.time()
+    start_time = time.perf_counter()
 
     if "audio" not in request.files or "name" not in request.form:
         return jsonify({"error": "audio and name are required"}), 400
@@ -366,15 +389,14 @@ def register():
     save_path = os.path.join(person_dir(name), f"{sample_id}.wav")
 
     try:
-        raw_bytes = file.read()
-        audio_seg = AudioSegment.from_file(io.BytesIO(raw_bytes))
-        audio_seg.export(save_path, format="wav")
+        audio, sr = decode_audio_bytes(file.read())
+        sf.write(save_path, audio, sr)
     except Exception as e:
         logging.exception("[register] audio conversion failed")
         return jsonify({"error": f"音声変換失敗: {e}"}), 500
 
     try:
-        t0 = time.time()
+        t0 = time.perf_counter()
         speech = preprocess(*sf.read(save_path, dtype='float32'))
         speech_sec = speech_seconds(speech)
         if speech_sec < MIN_REGISTER_SEC:
@@ -386,7 +408,7 @@ def register():
             }), 400
         embedding = embed(speech)
         np.save(cache_path_for(save_path), embedding)
-        print(f"[register] get_embedding took {time.time() - t0:.3f} sec (speech {speech_sec:.1f}s)")
+        print(f"[register] get_embedding took {time.perf_counter() - t0:.3f} sec (speech {speech_sec:.1f}s)")
     except Exception as e:
         logging.exception("[register] get_embedding failed")
         os.remove(save_path)
@@ -403,7 +425,7 @@ def register():
         metadata[name] = {"kana": kana or name}
     save_metadata()
 
-    print(f"[register] Total time: {time.time() - start_time:.3f} sec")
+    print(f"[register] Total time: {time.perf_counter() - start_time:.3f} sec")
     return jsonify({
         "status": "ok",
         "name": name,
@@ -468,7 +490,7 @@ def delete_sample(name, sample_id):
 @app.route("/identify", methods=["POST"])
 def identify():
     require_auth()
-    start_time = time.time()
+    start_time = time.perf_counter()
     log("[identify] request received")
 
     if "audio" not in request.files:
@@ -479,8 +501,11 @@ def identify():
 
     source = request.form.get("source", "api")
     try:
-        t0 = time.time()
-        speech = preprocess(*decode_audio_bytes(audio_bytes))
+        t0 = time.perf_counter()
+        audio, sr = decode_audio_bytes(audio_bytes)
+        t_decode = time.perf_counter()
+        speech = preprocess(audio, sr)
+        t_pre = time.perf_counter()
         speech_sec = speech_seconds(speech)
         if speech_sec < MIN_IDENTIFY_SEC:
             log(f"[identify] too short: speech {speech_sec:.2f}s < {MIN_IDENTIFY_SEC}s")
@@ -504,18 +529,23 @@ def identify():
                 "speech_sec": round(speech_sec, 2),
                 "reason": "too_short",
             })
+        if MAX_IDENTIFY_SEC > 0:
+            speech = speech[:int(MAX_IDENTIFY_SEC * SAMPLE_RATE)]
         embedding = embed(speech)
-        log(f"[identify] get_embedding took {time.time() - t0:.3f} sec (speech {speech_sec:.1f}s)")
+        t_embed = time.perf_counter()
+        log(f"[identify] decode {(t_decode - t0) * 1000:.0f}ms (sr={sr}), "
+            f"preprocess {(t_pre - t_decode) * 1000:.0f}ms, "
+            f"embed {(t_embed - t_pre) * 1000:.0f}ms (speech {speech_sec:.1f}s, used {speech_seconds(speech):.1f}s)")
     except Exception as e:
         logging.exception("[identify] get_embedding failed")
         return jsonify({"error": str(e)}), 500
 
-    t0 = time.time()
+    t0 = time.perf_counter()
     scores = {name: float(np.dot(embedding, prof_embedding))
               for name, prof_embedding in profiles.items()}
     best_name = max(scores, key=scores.get) if scores else None
     best_score = scores[best_name] if best_name else -1
-    log(f"[identify] similarity search took {time.time() - t0:.3f} sec")
+    log(f"[identify] similarity search took {time.perf_counter() - t0:.3f} sec")
 
     accepted = best_name is not None and best_score >= SCORE_THRESHOLD
     identify_log.append({
@@ -534,7 +564,7 @@ def identify():
     ]
 
     log(f"[identify] best={best_name} score={best_score:.3f} threshold={SCORE_THRESHOLD}")
-    log(f"[identify] Total time: {time.time() - start_time:.3f} sec")
+    log(f"[identify] Total time: {time.perf_counter() - start_time:.3f} sec")
 
     if not accepted:
         return jsonify({

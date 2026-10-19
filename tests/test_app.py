@@ -7,6 +7,8 @@ import io
 import os
 import sys
 import json
+import shutil
+import subprocess
 import tempfile
 
 import numpy as np
@@ -558,6 +560,57 @@ class TestEmbedding:
         audio = np.random.rand(16000).astype(np.float32)
         emb = app_module.get_embedding_from_array(audio, 16000)
         assert np.isclose(np.linalg.norm(emb), 1.0, atol=1e-5)
+
+
+class TestDecodeAudio:
+    def test_wav_is_read_without_ffmpeg(self, monkeypatch):
+        """WAV は ffmpeg を起動せずに直接読む"""
+        def fail(*args, **kwargs):
+            raise AssertionError("ffmpeg should not be called for WAV")
+        monkeypatch.setattr(app_module.subprocess, "run", fail)
+        audio, sr = app_module.decode_audio_bytes(_make_wav(48000).getvalue())
+        assert sr == 16000 and len(audio) == 48000
+
+    @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+    def test_webm_is_decoded_by_ffmpeg(self):
+        """WebM/Opus（Chrome の録音形式）は ffmpeg で 16kHz モノラルにする"""
+        webm = subprocess.run(
+            ["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=300:duration=2:sample_rate=48000",
+             "-c:a", "libopus", "-f", "webm", "pipe:1"],
+            capture_output=True, check=True).stdout
+        audio, sr = app_module.decode_audio_bytes(webm)
+        assert sr == app_module.SAMPLE_RATE
+        assert audio.ndim == 1
+        assert abs(len(audio) / sr - 2.0) < 0.1
+
+    def test_invalid_bytes_raise(self):
+        with pytest.raises(ValueError):
+            app_module.decode_audio_bytes(b"not audio at all")
+
+    @pytest.mark.parametrize("sr", [8000, 22050, 44100, 48000])
+    def test_preprocess_resamples_to_16k(self, sr):
+        """どのサンプルレートでも 16kHz の長さになる"""
+        tone = 0.3 * np.sin(2 * np.pi * 200 * np.arange(2 * sr) / sr).astype(np.float32)
+        speech = app_module.preprocess(tone, sr)
+        assert abs(len(speech) - 2 * app_module.SAMPLE_RATE) <= app_module.SAMPLE_RATE * 0.05
+
+    def test_identify_uses_at_most_max_seconds(self, client, monkeypatch):
+        """長い音声は MAX_IDENTIFY_SEC で打ち切ってから埋め込みを計算する"""
+        monkeypatch.setattr(app_module, "profiles", {"alice": np.ones(192, dtype=np.float32)})
+        monkeypatch.setattr(app_module, "MAX_IDENTIFY_SEC", 2.0)
+        lengths = []
+        orig_embed = app_module.embed
+        monkeypatch.setattr(app_module, "embed", lambda x: lengths.append(len(x)) or orig_embed(x))
+        client.post("/identify", headers=AUTH,
+                    data={"audio": (_make_wav(16000 * 5), "q.wav", "audio/wav")},
+                    content_type="multipart/form-data")
+        assert lengths == [2 * app_module.SAMPLE_RATE]
+
+    def test_identify_invalid_audio_returns_500(self, client):
+        resp = client.post("/identify", headers=AUTH,
+                           data={"audio": (io.BytesIO(b"garbage"), "q.wav", "audio/wav")},
+                           content_type="multipart/form-data")
+        assert resp.status_code == 500
 
 
 class TestTrimSilence:
