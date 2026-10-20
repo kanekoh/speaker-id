@@ -41,11 +41,15 @@ SAMPLE_RATE = 16000
 # コサイン類似度がこの値未満なら「該当者なし」とする（実データで調整すること）
 SCORE_THRESHOLD = float(os.getenv("SPEAKER_SCORE_THRESHOLD", "0.5"))
 
-# 識別結果の履歴（スコア確認用、メモリ上のみで再起動すると消える）
-identify_log = deque(maxlen=int(os.getenv("IDENTIFY_LOG_SIZE", "200")))
-# 直近の識別で届いた録音そのもの（再生・登録用）。id -> {"bytes": ..., "source": ...}
-IDENTIFY_AUDIO_SIZE = int(os.getenv("IDENTIFY_AUDIO_SIZE", "30"))
-identify_audio = OrderedDict()
+# 識別結果の履歴と、届いた録音そのもの（再生・登録用）
+# LOG_DIR/log.jsonl に履歴を追記し、録音は LOG_DIR/audio/<id>.<拡張子> に保存する（再起動しても残る）
+LOG_DIR = os.getenv("SPEAKER_LOG_DIR", "identify_log")
+LOG_FILE = os.path.join(LOG_DIR, "log.jsonl")
+LOG_AUDIO_DIR = os.path.join(LOG_DIR, "audio")
+IDENTIFY_LOG_SIZE = int(os.getenv("IDENTIFY_LOG_SIZE", "500"))
+IDENTIFY_AUDIO_SIZE = int(os.getenv("IDENTIFY_AUDIO_SIZE", "200"))
+identify_log = deque(maxlen=IDENTIFY_LOG_SIZE)
+identify_audio = OrderedDict()  # id -> {"path": ..., "source": ..., "registered_to": ...}
 identify_lock = threading.Lock()
 _identify_ids = itertools.count(1)
 
@@ -560,16 +564,90 @@ def delete_sample(name, sample_id):
     return jsonify({"status": "deleted", "name": name, "sample_id": sample_id,
                     "num_samples": len(samples.get(name, {}))})
 
+def _append_log_record(record: dict):
+    with open(LOG_FILE, "a") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _prune_identify_audio():
+    """古い録音を IDENTIFY_AUDIO_SIZE 件まで削除する（identify_lock を持った状態で呼ぶ）"""
+    while len(identify_audio) > max(IDENTIFY_AUDIO_SIZE, 0):
+        _, old = identify_audio.popitem(last=False)
+        try:
+            os.remove(old["path"])
+        except OSError:
+            pass
+
+
 def add_identify_log(entry: dict, audio_bytes: bytes) -> int:
-    """識別結果を履歴に追加し、録音も直近 IDENTIFY_AUDIO_SIZE 件だけ保持する"""
+    """識別結果を履歴に追加し、録音も直近 IDENTIFY_AUDIO_SIZE 件だけ保存する"""
     with identify_lock:
         entry_id = next(_identify_ids)
-        identify_log.append({"id": entry_id, "time": datetime.now().isoformat(timespec="seconds"), **entry})
-        if IDENTIFY_AUDIO_SIZE > 0:
-            identify_audio[entry_id] = {"bytes": audio_bytes, "source": entry["source"]}
-            while len(identify_audio) > IDENTIFY_AUDIO_SIZE:
-                identify_audio.popitem(last=False)
+        record = {"id": entry_id, "time": datetime.now().isoformat(timespec="seconds"), **entry}
+        identify_log.append(record)
+        try:
+            _append_log_record({"type": "entry", **record})
+            if IDENTIFY_AUDIO_SIZE > 0:
+                # 変換せずに届いたまま保存する（識別の応答を遅くしないため）
+                ext = "wav" if audio_bytes[:4] == b"RIFF" else "bin"
+                path = os.path.join(LOG_AUDIO_DIR, f"{entry_id}.{ext}")
+                with open(path, "wb") as f:
+                    f.write(audio_bytes)
+                identify_audio[entry_id] = {"path": path, "source": entry["source"]}
+                _prune_identify_audio()
+        except OSError as e:
+            logging.error(f"[identify] could not save log: {e}")
     return entry_id
+
+
+def load_identify_log():
+    """保存済みの履歴と録音を読み込み、履歴ファイルを直近分だけに詰め直す"""
+    global _identify_ids
+    os.makedirs(LOG_AUDIO_DIR, exist_ok=True)
+    entries, registered = OrderedDict(), {}
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE) as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue  # 書き込み途中で止まった行などは捨てる
+                kind = record.pop("type", "entry")
+                if kind == "entry":
+                    entries[record["id"]] = record
+                elif kind == "registered":
+                    registered[record["id"]] = record["name"]
+    recent = list(entries.values())[-IDENTIFY_LOG_SIZE:]
+    with identify_lock:
+        identify_log.clear()
+        identify_log.extend(recent)
+        identify_audio.clear()
+        audio_files = {int(fn.split(".")[0]): fn for fn in os.listdir(LOG_AUDIO_DIR)
+                       if fn.split(".")[0].isdigit()}
+        for entry_id, fn in sorted(audio_files.items()):
+            path = os.path.join(LOG_AUDIO_DIR, fn)
+            if entry_id not in entries:
+                os.remove(path)  # 履歴の無い録音は消す
+                continue
+            identify_audio[entry_id] = {"path": path, "source": entries[entry_id]["source"]}
+            if entry_id in registered:
+                identify_audio[entry_id]["registered_to"] = registered[entry_id]
+        _prune_identify_audio()
+        # 追記で大きくなった履歴ファイルを、残っている分だけで書き直す
+        tmp = LOG_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            for record in recent:
+                f.write(json.dumps({"type": "entry", **record}, ensure_ascii=False) + "\n")
+            for entry_id, item in identify_audio.items():
+                if item.get("registered_to"):
+                    f.write(json.dumps({"type": "registered", "id": entry_id,
+                                        "name": item["registered_to"]}, ensure_ascii=False) + "\n")
+        os.replace(tmp, LOG_FILE)
+        _identify_ids = itertools.count(max([0, *entries]) + 1)
+    log(f"[startup] identify log: {len(identify_log)} entries, {len(identify_audio)} recordings ({LOG_DIR})")
+
+
+load_identify_log()
 
 
 @app.route("/identify", methods=["POST"])
@@ -694,27 +772,36 @@ def clear_identify_log():
     require_auth()
     with identify_lock:
         identify_log.clear()
+        for item in identify_audio.values():
+            try:
+                os.remove(item["path"])
+            except OSError:
+                pass
         identify_audio.clear()
+        open(LOG_FILE, "w").close()
     return jsonify({"status": "cleared"})
 
 
-def get_identify_audio(entry_id: int) -> dict:
+def get_identify_audio(entry_id: int):
+    """(録音の情報, 録音のバイト列) を返す"""
     with identify_lock:
         item = identify_audio.get(entry_id)
-    if item is None:
+    try:
+        with open(item["path"], "rb") as f:
+            return item, f.read()
+    except (TypeError, OSError):
         abort(404, description="録音が残っていません（古い記録の録音は順に削除されます）")
-    return item
 
 
 @app.route("/identify_log/<int:entry_id>/register", methods=["POST"])
 def register_from_identify_log(entry_id):
     """識別で届いた録音（スタックチャンのマイクの音など）をそのまま登録に使う"""
     require_auth()
-    item = get_identify_audio(entry_id)
+    item, audio_bytes = get_identify_audio(entry_id)
     if item.get("registered_to"):
         return jsonify({"error": f"この録音はすでに {item['registered_to']} として登録済みです"}), 409
     body = request.get_json(silent=True) or {}
-    audio, sr = decode_audio_bytes(item["bytes"])
+    audio, sr = decode_audio_bytes(audio_bytes)
     result, status = add_sample(
         name=str(body.get("name", "")).strip(),
         kana=str(body.get("kana", "")).strip(),
@@ -723,7 +810,12 @@ def register_from_identify_log(entry_id):
         env=env_of_source(item["source"]),
     )
     if status == 200:
-        item["registered_to"] = result["name"]
+        with identify_lock:
+            item["registered_to"] = result["name"]
+            try:
+                _append_log_record({"type": "registered", "id": entry_id, "name": result["name"]})
+            except OSError as e:
+                logging.error(f"[register] could not save log: {e}")
     return jsonify(result), status
 
 
@@ -731,9 +823,9 @@ def register_from_identify_log(entry_id):
 def identify_log_audio(entry_id):
     """識別で届いた録音を WAV で返す。kind=raw: 元の音 / processed: モデルに入力した音"""
     require_auth()
-    item = get_identify_audio(entry_id)
+    _, audio_bytes = get_identify_audio(entry_id)
     kind = request.args.get("kind", "raw")
-    audio, sr = decode_audio_bytes(item["bytes"])
+    audio, sr = decode_audio_bytes(audio_bytes)
     if kind == "raw":
         data = wav_bytes(audio, sr)
     elif kind == "processed":

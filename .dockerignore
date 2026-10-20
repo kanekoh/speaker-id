@@ -2,6 +2,7 @@ __pycache__/
 .git/
 *.wav
 profiles/
+identify_log/
 *.log
 *.tmp
 

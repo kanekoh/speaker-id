@@ -45,6 +45,7 @@ os.environ.setdefault("SPEAKERID_API_KEY", "test-secret-token-for-pytest")
 os.environ.setdefault("SPEAKER_MODEL_PATH", "/tmp/dummy.onnx")
 # 本物の profiles/ を移行・変更しないよう、テスト用の一時ディレクトリを使う
 os.environ["SPEAKER_PROFILE_DIR"] = tempfile.mkdtemp(prefix="speaker-id-test-")
+os.environ["SPEAKER_LOG_DIR"] = tempfile.mkdtemp(prefix="speaker-id-log-")
 
 import app as app_module  # noqa: E402
 
@@ -674,6 +675,40 @@ class TestIdentifyLog:
         self._identify(client)
         client.delete("/identify_log", headers=AUTH)
         assert len(app_module.identify_audio) == 0
+
+    def test_log_survives_restart(self, client, isolated_profiles):
+        """履歴・録音・登録済みの状態はディスクに残り、再起動（再読み込み）後も使える"""
+        client.delete("/identify_log", headers=AUTH)
+        _register(client, "alice")
+        self._identify(client, source="stackchan")
+        self._identify(client, source="stackchan")
+        first, second = [e["id"] for e in app_module.identify_log]
+        client.post(f"/identify_log/{first}/register", headers=AUTH, json={"name": "alice"})
+
+        app_module.load_identify_log()  # 再起動の代わり
+
+        entries = client.get("/identify_log", headers=AUTH).get_json()["entries"]
+        assert [e["id"] for e in entries] == [first, second]
+        assert [e["registered_to"] for e in entries] == ["alice", None]
+        assert client.get(f"/identify_log/{second}/audio", headers=AUTH).status_code == 200
+        # ID は続きから振られる
+        self._identify(client)
+        assert app_module.identify_log[-1]["id"] == second + 1
+
+    def test_old_audio_files_are_deleted(self, client, monkeypatch):
+        monkeypatch.setattr(app_module, "profiles", {"alice": np.ones(192, dtype=np.float32)})
+        monkeypatch.setattr(app_module, "IDENTIFY_AUDIO_SIZE", 2)
+        client.delete("/identify_log", headers=AUTH)
+        for _ in range(3):
+            self._identify(client)
+        assert len(os.listdir(app_module.LOG_AUDIO_DIR)) == 2
+
+    def test_load_skips_broken_lines(self, client):
+        client.delete("/identify_log", headers=AUTH)
+        with open(app_module.LOG_FILE, "a") as f:
+            f.write('{"type": "entry", "id": 5, "time": "2026-01-01T00:00:00", "source": "api"}\n{"broken\n')
+        app_module.load_identify_log()
+        assert [e["id"] for e in app_module.identify_log] == [5]
 
     def test_scores_page_accessible(self, client):
         """GET /scores.html は認証不要でページが返る"""
