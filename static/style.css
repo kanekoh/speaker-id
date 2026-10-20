@@ -148,6 +148,8 @@ input:focus-visible, button:focus-visible, a:focus-visible {
 .segmented label:has(input:checked) { background: var(--accent); color: var(--accent-text); }
 .segmented label:has(input:disabled) { opacity: 0.45; cursor: not-allowed; }
 .segmented label:has(input:focus-visible) { outline: 2px solid var(--focus); outline-offset: -2px; }
+.enroll-added { margin: 8px 0 0; padding-left: 1.4em; font-size: 0.9em; color: var(--text-secondary); }
+.enroll-added .low { color: var(--critical); }
 .compare-panel {
   background: var(--surface-2); border-radius: 6px;
   padding: 10px 14px; margin: 0 0 12px;

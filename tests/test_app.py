@@ -398,10 +398,21 @@ class TestEnvironments:
     def test_short_identify_audio_cannot_be_registered(self, client, isolated_profiles):
         """登録の最低秒数に満たない録音は 400 で、登録済みにもならない"""
         _register(client, "alice")
-        entry = _identify_entry(client, wav=_make_speech_wav(1.5, silence_sec=1.0))
+        entry = _identify_entry(client, wav=_make_speech_wav(1.0, silence_sec=1.0))
         resp = client.post(f"/identify_log/{entry['id']}/register", headers=AUTH, json={"name": "alice"})
         assert resp.status_code == 400
         assert app_module.identify_audio[entry["id"]].get("registered_to") is None
+
+    def test_device_recording_needs_shorter_speech(self, client, isolated_profiles):
+        """スタックチャンの録音は自然な一言でよいので、ブラウザ（3 秒）より短くても登録できる"""
+        _register(client, "alice")
+        entry = _identify_entry(client, source="stackchan", wav=_make_speech_wav(2.0, silence_sec=1.0))
+        resp = client.post(f"/identify_log/{entry['id']}/register", headers=AUTH, json={"name": "alice"})
+        assert resp.status_code == 200
+        # 同じ長さでも、識別テスト画面（ブラウザ）の録音は 3 秒に満たないので登録できない
+        entry = _identify_entry(client, source="test", wav=_make_speech_wav(2.0, silence_sec=1.0))
+        resp = client.post(f"/identify_log/{entry['id']}/register", headers=AUTH, json={"name": "alice"})
+        assert resp.status_code == 400
 
     def test_profile_score_uses_closest_environment(self):
         """プロファイルは環境ごとの平均の組で、最も近いものとのスコアを使う"""
@@ -429,6 +440,80 @@ class TestEnvironments:
         client.delete(f"/profiles/alice/samples/{sample_id}", headers=AUTH)
         assert not (isolated_profiles / "alice" / f"{sample_id}.json").exists()
         assert app_module.profiles["alice"].shape[0] == 1
+
+
+class TestEnrollSession:
+    @pytest.fixture(autouse=True)
+    def _reset(self, monkeypatch):
+        monkeypatch.setattr(app_module, "enroll_session", None)
+
+    def _start(self, client, **body):
+        return client.post("/enroll_session", headers=AUTH, json={"name": "alice", **body})
+
+    def test_requires_auth_and_existing_person(self, client, isolated_profiles):
+        assert client.post("/enroll_session", json={"name": "alice"}).status_code == 401
+        assert self._start(client).status_code == 404
+        _register(client, "alice")
+        session = self._start(client, count=3).get_json()["session"]
+        assert session["active"] and session["total"] == 3 and session["remaining"] == 3
+
+    def test_device_utterances_are_added_until_count(self, client, isolated_profiles):
+        """登録待ちの間にスタックチャンから届いた声が、回数分だけ登録に加わる"""
+        _register(client, "alice")
+        self._start(client, count=2)
+        ids = [_identify_entry(client, source="stackchan", wav=_make_speech_wav(3.0, silence_sec=1.0))["id"]
+               for _ in range(3)]
+        session = client.get("/enroll_session", headers=AUTH).get_json()["session"]
+        assert session["done"] == 2 and not session["active"]
+        assert len(app_module.samples["alice"]) == 3          # ブラウザ 1 + スタックチャン 2
+        assert sorted(app_module.sample_envs["alice"].values()) == ["browser", "device", "device"]
+        assert [app_module.identify_audio[i].get("registered_to") for i in ids] == ["alice", "alice", None]
+
+    def test_browser_and_short_utterances_are_not_added(self, client, isolated_profiles):
+        """識別テスト画面からの録音と、短い返事は使わない（短いものは回数にも数えない）"""
+        _register(client, "alice")
+        self._start(client, count=2)
+        _identify_entry(client, source="test")
+        _identify_entry(client, source="stackchan", wav=_make_speech_wav(1.0, silence_sec=1.0))
+        session = client.get("/enroll_session", headers=AUTH).get_json()["session"]
+        _identify_entry(client, source="stackchan", wav=_make_speech_wav(0.3, silence_sec=1.0))
+        session = client.get("/enroll_session", headers=AUTH).get_json()["session"]
+        assert session["done"] == 0 and session["remaining"] == 2
+        assert session["skipped"] == {"short": 2, "noisy": 0}
+        assert len(app_module.samples["alice"]) == 1
+
+    def test_noisy_utterances_are_not_added(self, client, isolated_profiles):
+        """SN 比が低い（ノイズが多い）発話は自動登録に使わない"""
+        import soundfile as sf
+        _register(client, "alice")
+        self._start(client, count=2)
+        rng = np.random.default_rng(0)
+        sr = 16000
+        tone = 0.3 * np.sin(2 * np.pi * 200 * np.arange(3 * sr) / sr)
+        noisy = np.concatenate([np.zeros(sr), tone, np.zeros(sr)]) + 0.1 * rng.standard_normal(5 * sr)
+        buf = io.BytesIO()
+        sf.write(buf, noisy.astype(np.float32), sr, format="WAV")
+        buf.seek(0)
+        entry = _identify_entry(client, source="stackchan", wav=buf)
+        assert entry["snr_db"] < app_module.ENROLL_MIN_SNR_DB
+        session = client.get("/enroll_session", headers=AUTH).get_json()["session"]
+        assert session["skipped"]["noisy"] == 1 and session["done"] == 0
+
+    def test_stop_and_expiry(self, client, isolated_profiles, monkeypatch):
+        _register(client, "alice")
+        # 前提: 登録待ち中なら、この発話は登録に加わる
+        self._start(client, count=1)
+        _identify_entry(client, source="stackchan", wav=_make_speech_wav(3.0, silence_sec=1.0))
+        assert len(app_module.samples["alice"]) == 2
+        self._start(client)
+        assert client.delete("/enroll_session", headers=AUTH).get_json()["session"]["active"] is False
+        _identify_entry(client, source="stackchan", wav=_make_speech_wav(3.0, silence_sec=1.0))
+        assert len(app_module.samples["alice"]) == 2
+        # 期限切れ
+        self._start(client, minutes=1)
+        app_module.enroll_session["expires_at"] = 0
+        _identify_entry(client, source="stackchan", wav=_make_speech_wav(3.0, silence_sec=1.0))
+        assert len(app_module.samples["alice"]) == 2
 
 
 # -----------------------------------------------------------------------

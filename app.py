@@ -89,6 +89,8 @@ SILENCE_FLOOR_DB = -50.0    # これより小さい音は常に無音扱い（dB
 SILENCE_RANGE_DB = 30.0     # 最も大きいフレームからこれ以上小さいフレームを無音扱い
 SPEECH_PAD_FRAMES = 5       # 声の前後に残す余白（フレーム数、5 × 30ms = 150ms）
 MIN_REGISTER_SEC = float(os.getenv("SPEAKER_MIN_REGISTER_SEC", "3.0"))
+# スタックチャン経由の録音は自然な会話の一言なので、短めでも登録に使う（何本も平均して補う）
+MIN_REGISTER_DEVICE_SEC = float(os.getenv("SPEAKER_MIN_REGISTER_DEVICE_SEC", "1.5"))
 MIN_IDENTIFY_SEC = float(os.getenv("SPEAKER_MIN_IDENTIFY_SEC", "1.0"))
 # 識別に使う声の最大長（埋め込みの計算時間は長さに比例するため。0 で無制限）
 MAX_IDENTIFY_SEC = float(os.getenv("SPEAKER_MAX_IDENTIFY_SEC", "6.0"))
@@ -468,10 +470,11 @@ def add_sample(name: str, kana: str, mode: str, audio: np.ndarray, sr: int, env:
 
     speech = preprocess(audio, sr)
     speech_sec = speech_seconds(speech)
-    if speech_sec < MIN_REGISTER_SEC:
+    min_sec = MIN_REGISTER_DEVICE_SEC if env == ENV_DEVICE else MIN_REGISTER_SEC
+    if speech_sec < min_sec:
         return {
             "error": f"声の部分が短すぎます（{speech_sec:.1f}秒）。"
-                     f"{MIN_REGISTER_SEC:.0f}秒以上話してください",
+                     f"{min_sec:g}秒以上の録音を使ってください",
             "speech_sec": round(speech_sec, 2),
         }, 400
     embedding = embed(speech)
@@ -695,7 +698,7 @@ def identify():
         speech_sec = speech_seconds(speech)
         if speech_sec < MIN_IDENTIFY_SEC:
             log(f"[identify] too short: speech {speech_sec:.2f}s < {MIN_IDENTIFY_SEC}s")
-            add_identify_log({
+            entry_id = add_identify_log({
                 "source": source,
                 "result": None,
                 "candidate": None,
@@ -705,6 +708,7 @@ def identify():
                 "reason": "too_short",
                 **levels,
             }, audio_bytes)
+            maybe_enroll(entry_id, audio, sr, speech_sec, levels["snr_db"], source)
             return jsonify({
                 "name": None,
                 "kana": None,
@@ -734,7 +738,7 @@ def identify():
     log(f"[identify] similarity search took {time.perf_counter() - t0:.3f} sec")
 
     accepted = best_name is not None and best_score >= SCORE_THRESHOLD
-    add_identify_log({
+    entry_id = add_identify_log({
         "source": source,
         "result": best_name if accepted else None,
         "candidate": best_name,
@@ -744,6 +748,7 @@ def identify():
         "reason": None if accepted else "below_threshold",
         **levels,
     }, audio_bytes)
+    maybe_enroll(entry_id, audio, sr, speech_sec, levels["snr_db"], source)
     score_list = [
         {"name": name, "kana": metadata.get(name, {}).get("kana", name), "score": round(score, 3)}
         for name, score in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
@@ -814,6 +819,138 @@ def get_identify_audio(entry_id: int):
         abort(404, description="録音が残っていません（古い記録の録音は順に削除されます）")
 
 
+def mark_registered(entry_id: int, name: str):
+    """識別ログの録音を「登録済み」にする（同じ録音を二重に登録しないため）"""
+    with identify_lock:
+        item = identify_audio.get(entry_id)
+        if item is not None:
+            item["registered_to"] = name
+        try:
+            _append_log_record({"type": "registered", "id": entry_id, "name": name})
+        except OSError as e:
+            logging.error(f"[register] could not save log: {e}")
+
+
+# ---- スタックチャンで話した声を自動で登録する（先に人を選んでおく方式） ----
+ENROLL_MAX_COUNT = 20
+# 自動登録では人が録音を確かめないので、ノイズの多い発話は使わない（スコア画面の ⚠ と同じ基準）
+ENROLL_MIN_SNR_DB = float(os.getenv("SPEAKER_ENROLL_MIN_SNR_DB", "15"))
+ENROLL_MAX_MINUTES = 30
+enroll_session = None  # {"name", "total", "remaining", "expires_at", "added": [...], "skipped": {...}, "errors"}
+enroll_lock = threading.Lock()
+
+
+def run_background(fn):
+    """識別の応答を遅らせないよう別スレッドで実行する（テスト中はその場で実行）"""
+    if app.testing:
+        fn()
+    else:
+        threading.Thread(target=fn, daemon=True).start()
+
+
+def _active_enroll_session():
+    """有効な登録待ちがあれば返す（enroll_lock を持った状態で呼ぶ）"""
+    sess = enroll_session
+    if sess and sess["remaining"] > 0 and time.time() < sess["expires_at"]:
+        return sess
+    return None
+
+
+def maybe_enroll(entry_id: int, audio: np.ndarray, sr: int, speech_sec: float,
+                 snr_db, source: str):
+    """登録待ちの間にスタックチャンから届いた声を、選ばれた人の登録に加える"""
+    if env_of_source(source) != ENV_DEVICE:
+        return
+    with enroll_lock:
+        sess = _active_enroll_session()
+        if sess is None:
+            return
+        # 「はい」など短い返事や、ノイズの多い発話は使わない（回数にも数えない）
+        if speech_sec < MIN_REGISTER_DEVICE_SEC:
+            sess["skipped"]["short"] += 1
+            return
+        if snr_db is not None and snr_db < ENROLL_MIN_SNR_DB:
+            sess["skipped"]["noisy"] += 1
+            return
+        sess["remaining"] -= 1  # 先に枠を確保しておく（同時に届いた分で数を超えないように）
+
+    def work():
+        body, status = add_sample(sess["name"], "", "add", audio, sr, ENV_DEVICE)
+        with enroll_lock:
+            if status == 200:
+                sess["added"].append({"entry_id": entry_id, "sample_id": body["sample_id"],
+                                      "consistency": body["consistency"],
+                                      "speech_sec": body["speech_sec"]})
+            else:
+                sess["remaining"] += 1
+                sess["errors"].append(body.get("error", str(status)))
+                if status == 404:  # 途中で登録者が削除された
+                    sess["remaining"] = 0
+        if status == 200:
+            mark_registered(entry_id, sess["name"])
+        log(f"[enroll] {sess['name']}: entry {entry_id} -> {status} ({sess['remaining']} left)")
+
+    run_background(work)
+
+
+def enroll_session_view():
+    with enroll_lock:
+        sess = enroll_session
+        if sess is None:
+            return None
+        return {
+            "name": sess["name"],
+            "kana": metadata.get(sess["name"], {}).get("kana", sess["name"]),
+            "total": sess["total"],
+            "done": len(sess["added"]),
+            "remaining": sess["remaining"],
+            "skipped": dict(sess["skipped"]),
+            "errors": sess["errors"][-3:],
+            "added": list(sess["added"]),
+            "active": _active_enroll_session() is not None,
+            "expires_in": max(0, round(sess["expires_at"] - time.time())),
+            "min_sec": MIN_REGISTER_DEVICE_SEC,
+            "min_snr_db": ENROLL_MIN_SNR_DB,
+        }
+
+
+@app.route("/enroll_session", methods=["POST"])
+def start_enroll_session():
+    """次にスタックチャンへ話しかけた count 回分を name の登録に加える（minutes 分で終了）"""
+    global enroll_session
+    require_auth()
+    body = request.get_json(silent=True) or {}
+    name = str(body.get("name", "")).strip()
+    if name not in samples:
+        return jsonify({"error": f"識別名「{name}」は登録されていません"}), 404
+    try:
+        count = min(max(int(body.get("count", 5)), 1), ENROLL_MAX_COUNT)
+        minutes = min(max(float(body.get("minutes", 5)), 1), ENROLL_MAX_MINUTES)
+    except (TypeError, ValueError):
+        return jsonify({"error": "count と minutes は数値で指定してください"}), 400
+    with enroll_lock:
+        enroll_session = {"name": name, "total": count, "remaining": count,
+                          "expires_at": time.time() + minutes * 60,
+                          "added": [], "skipped": {"short": 0, "noisy": 0}, "errors": []}
+    log(f"[enroll] start: {name} x{count} ({minutes:g} min)")
+    return jsonify({"session": enroll_session_view()})
+
+
+@app.route("/enroll_session", methods=["GET"])
+def get_enroll_session():
+    require_auth()
+    return jsonify({"session": enroll_session_view()})
+
+
+@app.route("/enroll_session", methods=["DELETE"])
+def stop_enroll_session():
+    require_auth()
+    with enroll_lock:
+        if enroll_session is not None:
+            enroll_session["remaining"] = 0
+    return jsonify({"session": enroll_session_view()})
+
+
 @app.route("/identify_log/<int:entry_id>/register", methods=["POST"])
 def register_from_identify_log(entry_id):
     """識別で届いた録音（スタックチャンのマイクの音など）をそのまま登録に使う"""
@@ -831,12 +968,7 @@ def register_from_identify_log(entry_id):
         env=env_of_source(item["source"]),
     )
     if status == 200:
-        with identify_lock:
-            item["registered_to"] = result["name"]
-            try:
-                _append_log_record({"type": "registered", "id": entry_id, "name": result["name"]})
-            except OSError as e:
-                logging.error(f"[register] could not save log: {e}")
+        mark_registered(entry_id, result["name"])
     return jsonify(result), status
 
 
