@@ -546,6 +546,45 @@ class TestIdentifyLog:
         assert client.delete("/identify_log", headers=AUTH).status_code == 200
         assert client.get("/identify_log", headers=AUTH).get_json()["entries"] == []
 
+    def test_entry_has_id_levels_and_audio(self, client, monkeypatch):
+        """履歴には id・SN 比が入り、録音を再生できる"""
+        monkeypatch.setattr(app_module, "profiles", {"alice": np.ones(192, dtype=np.float32)})
+        client.delete("/identify_log", headers=AUTH)
+        self._identify(client)
+        entry = client.get("/identify_log", headers=AUTH).get_json()["entries"][-1]
+        assert isinstance(entry["id"], int)
+        assert entry["has_audio"] is True
+        assert {"snr_db", "noise_db", "speech_db"} <= set(entry)
+
+        for kind in ["raw", "processed"]:
+            resp = client.get(f"/identify_log/{entry['id']}/audio?kind={kind}", headers=AUTH)
+            assert resp.status_code == 200
+            assert resp.mimetype == "audio/wav"
+            import soundfile as sf
+            audio, sr = sf.read(io.BytesIO(resp.data))
+            assert len(audio) > 0
+        assert client.get(f"/identify_log/{entry['id']}/audio?kind=xx", headers=AUTH).status_code == 400
+
+    def test_audio_requires_auth_and_existing_entry(self, client):
+        assert client.get("/identify_log/1/audio").status_code == 401
+        assert client.get("/identify_log/999999/audio", headers=AUTH).status_code == 404
+
+    def test_only_recent_audio_is_kept(self, client, monkeypatch):
+        """録音は直近 IDENTIFY_AUDIO_SIZE 件だけ保持する（履歴は残る）"""
+        monkeypatch.setattr(app_module, "profiles", {"alice": np.ones(192, dtype=np.float32)})
+        monkeypatch.setattr(app_module, "IDENTIFY_AUDIO_SIZE", 2)
+        client.delete("/identify_log", headers=AUTH)
+        for _ in range(3):
+            self._identify(client)
+        entries = client.get("/identify_log", headers=AUTH).get_json()["entries"]
+        assert [e["has_audio"] for e in entries] == [False, True, True]
+
+    def test_clear_log_removes_audio(self, client, monkeypatch):
+        monkeypatch.setattr(app_module, "profiles", {"alice": np.ones(192, dtype=np.float32)})
+        self._identify(client)
+        client.delete("/identify_log", headers=AUTH)
+        assert len(app_module.identify_audio) == 0
+
     def test_scores_page_accessible(self, client):
         """GET /scores.html は認証不要でページが返る"""
         assert client.get("/scores.html").status_code == 200
@@ -611,6 +650,23 @@ class TestDecodeAudio:
                            data={"audio": (io.BytesIO(b"garbage"), "q.wav", "audio/wav")},
                            content_type="multipart/form-data")
         assert resp.status_code == 500
+
+
+class TestMeasureLevels:
+    def test_snr_of_tone_with_noise(self):
+        """声（正弦波）とノイズの差がおおよそ SN 比として出る"""
+        sr = app_module.SAMPLE_RATE
+        rng = np.random.default_rng(0)
+        noise = 0.003 * rng.standard_normal(3 * sr)       # 約 -50dB
+        tone = 0.3 * np.sin(2 * np.pi * 200 * np.arange(sr) / sr)  # 約 -13dB
+        audio = noise.copy()
+        audio[sr:2 * sr] += tone
+        levels = app_module.measure_levels(audio.astype(np.float32))
+        assert -53 < levels["noise_db"] < -47
+        assert 30 < levels["snr_db"] < 42
+
+    def test_too_short(self):
+        assert app_module.measure_levels(np.zeros(10, dtype=np.float32))["snr_db"] is None
 
 
 class TestTrimSilence:

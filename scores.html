@@ -41,7 +41,7 @@
 
     <section class="card viz-root">
       <h2>ログ</h2>
-      <p class="card-sub">サーバーのメモリ上に直近の記録だけを保持しています（再起動で消えます）。</p>
+      <p class="card-sub">サーバーのメモリ上に直近の記録だけを保持しています（再起動で消えます）。録音は直近の数十件だけ再生できます。「元」は届いた音そのまま、「処理後」は無音を除いてモデルに入力した音です。SN比（声とノイズの大きさの差）が15dB未満の録音は ⚠ を付けています。</p>
       <div id="logTable"></div>
     </section>
   </main>
@@ -78,7 +78,48 @@
         document.getElementById("latestChart").replaceChildren();
       }
       ScoreCharts.renderMultiples(document.getElementById("multiples"), data);
-      ScoreCharts.renderTable(document.getElementById("logTable"), data);
+      ScoreCharts.renderTable(document.getElementById("logTable"), data, { renderActions });
+    }
+
+    // ---- 録音の再生 ----
+    let player = null;
+    let playingButton = null;
+
+    function stopPlaying() {
+      if (player) { player.pause(); URL.revokeObjectURL(player.src); }
+      if (playingButton) playingButton.textContent = playingButton.dataset.label;
+      player = null; playingButton = null;
+    }
+
+    async function play(entryId, kind, button) {
+      const same = playingButton && playingButton.dataset.key === `${entryId}-${kind}`;
+      stopPlaying();
+      if (same) return;  // 再生中のボタンをもう一度押したら停止
+      const res = await Auth.authFetch(`/identify_log/${entryId}/audio?kind=${kind}`);
+      if (!res.ok) { alert(`再生できません (HTTP ${res.status})`); return; }
+      player = new Audio(URL.createObjectURL(await res.blob()));
+      playingButton = button;
+      button.textContent = "■ 停止";
+      player.onended = stopPlaying;
+      player.play();
+    }
+
+    function renderActions(entry) {
+      if (!entry.has_audio) return null;
+      const box = document.createElement("div");
+      box.className = "row-actions";
+      for (const [kind, label] of [["raw", "▶ 元"], ["processed", "▶ 処理後"]]) {
+        const b = document.createElement("button");
+        b.className = "btn btn-small";
+        b.dataset.label = label;
+        b.dataset.key = `${entry.id}-${kind}`;
+        // 自動更新で表が作り直されても、再生中の表示を保つ
+        b.textContent = playingButton && playingButton.dataset.key === b.dataset.key ? "■ 停止" : label;
+        if (playingButton && playingButton.dataset.key === b.dataset.key) playingButton = b;
+        b.onclick = () => play(entry.id, kind, b);
+        box.appendChild(b);
+      }
+      return box;
     }
 
     function setAutoReload(on) {

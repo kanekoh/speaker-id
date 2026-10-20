@@ -16,6 +16,8 @@ window.ScoreCharts = (function () {
     return e;
   }
 
+  const LOW_SNR_DB = 15;
+
   function fmt(score) {
     return score === undefined || score === null ? "–" : Number(score).toFixed(3);
   }
@@ -194,7 +196,8 @@ window.ScoreCharts = (function () {
   }
 
   // ---- ログ表（新しい順） ----
-  function renderTable(container, data) {
+  // options.renderActions(entry) を渡すと、各行の末尾にその要素（再生ボタンなど）を置く
+  function renderTable(container, data, options = {}) {
     container.replaceChildren();
     if (data.entries.length === 0) {
       container.appendChild(el("p", { class: "empty" }, "まだ識別の記録がありません"));
@@ -203,7 +206,8 @@ window.ScoreCharts = (function () {
     const wrap = el("div", { class: "table-wrap" });
     const table = el("table", { class: "data-table" });
     const head = el("tr");
-    ["時刻", "送信元", "判定", "声の長さ", "最高スコア", ...data.people.map((p) => p.kana || p.name)]
+    ["時刻", "送信元", "判定", "声の長さ", "SN比", "ノイズ", "最高スコア",
+      ...data.people.map((p) => p.kana || p.name), ...(options.renderActions ? [""] : [])]
       .forEach((h) => head.appendChild(el("th", {}, h)));
     table.appendChild(el("thead")).appendChild(head);
     const body = el("tbody");
@@ -217,8 +221,19 @@ window.ScoreCharts = (function () {
           ? el("td", { class: "viz-status-ng" }, "✗ 短すぎ")
           : el("td", { class: "viz-status-ng" }, `✗ 該当なし${e.candidate ? `（${e.candidate}）` : ""}`));
       tr.appendChild(el("td", { class: "num" }, e.speech_sec == null ? "–" : `${e.speech_sec.toFixed(1)}秒`));
+      // SN 比が低い（声とノイズの差が小さい）録音は識別が不安定になりやすい
+      const lowSnr = e.snr_db != null && e.snr_db < LOW_SNR_DB;
+      tr.appendChild(el("td", { class: "num" + (lowSnr ? " low" : "") },
+        e.snr_db == null ? "–" : `${lowSnr ? "⚠ " : ""}${e.snr_db.toFixed(0)}dB`));
+      tr.appendChild(el("td", { class: "num" }, e.noise_db == null ? "–" : `${e.noise_db.toFixed(0)}dB`));
       tr.appendChild(el("td", { class: "num" }, fmt(e.score)));
       for (const p of data.people) tr.appendChild(el("td", { class: "num" }, fmt(e.scores[p.name])));
+      if (options.renderActions) {
+        const td = el("td");
+        const actions = options.renderActions(e);
+        if (actions) td.appendChild(actions);
+        tr.appendChild(td);
+      }
       body.appendChild(tr);
     }
     table.appendChild(body);

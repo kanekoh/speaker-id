@@ -4,6 +4,8 @@ import math
 import subprocess
 import hashlib
 import shutil
+import threading
+import itertools
 from flask import Flask, request, jsonify, send_from_directory, abort, send_file
 import sherpa_onnx
 import numpy as np
@@ -15,7 +17,7 @@ import logging
 import sys
 import zipfile
 import io
-from collections import deque
+from collections import deque, OrderedDict
 from datetime import datetime
 from werkzeug.exceptions import HTTPException
 
@@ -41,6 +43,11 @@ SCORE_THRESHOLD = float(os.getenv("SPEAKER_SCORE_THRESHOLD", "0.5"))
 
 # 識別結果の履歴（スコア確認用、メモリ上のみで再起動すると消える）
 identify_log = deque(maxlen=int(os.getenv("IDENTIFY_LOG_SIZE", "200")))
+# 直近の識別で届いた録音そのもの（再生・登録用）。id -> {"bytes": ..., "source": ...}
+IDENTIFY_AUDIO_SIZE = int(os.getenv("IDENTIFY_AUDIO_SIZE", "30"))
+identify_audio = OrderedDict()
+identify_lock = threading.Lock()
+_identify_ids = itertools.count(1)
 
 # 埋め込み計算のスレッド数（ラズパイ 4/5 は 4 コア）
 NUM_THREADS = int(os.getenv("SPEAKER_NUM_THREADS", str(min(4, os.cpu_count() or 1))))
@@ -119,15 +126,41 @@ def trim_silence(audio: np.ndarray) -> np.ndarray:
     return frames[voiced].reshape(-1)
 
 
-def preprocess(audio: np.ndarray, sr: int) -> np.ndarray:
-    """モノラル化・16kHz へのリサンプリング・無音除去をした波形を返す"""
+def to_mono_16k(audio: np.ndarray, sr: int) -> np.ndarray:
+    """モノラル化・16kHz へのリサンプリングをした波形を返す"""
     if audio.ndim > 1:
         audio = audio.mean(axis=1)
     if sr != SAMPLE_RATE:
         # FFT 方式（resample）は長さによって極端に遅くなるので、多相フィルタ方式を使う
         g = math.gcd(SAMPLE_RATE, sr)
         audio = scipy_signal.resample_poly(audio, SAMPLE_RATE // g, sr // g)
-    return trim_silence(audio.astype(np.float32))
+    return audio.astype(np.float32)
+
+
+def preprocess(audio: np.ndarray, sr: int) -> np.ndarray:
+    """モノラル化・16kHz へのリサンプリング・無音除去をした波形を返す"""
+    return trim_silence(to_mono_16k(audio, sr))
+
+
+def measure_levels(audio: np.ndarray) -> dict:
+    """16kHz 波形のノイズの大きさ・声の大きさ・SN 比（dB）を見積もる"""
+    frame = int(SAMPLE_RATE * FRAME_SEC)
+    n = len(audio) // frame
+    if n == 0:
+        return {"noise_db": None, "speech_db": None, "snr_db": None}
+    frames = audio[:n * frame].reshape(n, frame)
+    rms_db = 20 * np.log10(np.sqrt(np.mean(frames ** 2, axis=1)) + 1e-10)
+    # 静かなほうから 10% のフレームをノイズ、大きいほうから 5% のフレームを声とみなす
+    noise_db = float(np.percentile(rms_db, 10))
+    speech_db = float(np.percentile(rms_db, 95))
+    return {"noise_db": round(noise_db, 1), "speech_db": round(speech_db, 1),
+            "snr_db": round(speech_db - noise_db, 1)}
+
+
+def wav_bytes(audio: np.ndarray, sr: int) -> bytes:
+    buf = io.BytesIO()
+    sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
 
 
 def speech_seconds(speech: np.ndarray) -> float:
@@ -487,6 +520,18 @@ def delete_sample(name, sample_id):
     return jsonify({"status": "deleted", "name": name, "sample_id": sample_id,
                     "num_samples": len(samples.get(name, {}))})
 
+def add_identify_log(entry: dict, audio_bytes: bytes) -> int:
+    """識別結果を履歴に追加し、録音も直近 IDENTIFY_AUDIO_SIZE 件だけ保持する"""
+    with identify_lock:
+        entry_id = next(_identify_ids)
+        identify_log.append({"id": entry_id, "time": datetime.now().isoformat(timespec="seconds"), **entry})
+        if IDENTIFY_AUDIO_SIZE > 0:
+            identify_audio[entry_id] = {"bytes": audio_bytes, "source": entry["source"]}
+            while len(identify_audio) > IDENTIFY_AUDIO_SIZE:
+                identify_audio.popitem(last=False)
+    return entry_id
+
+
 @app.route("/identify", methods=["POST"])
 def identify():
     require_auth()
@@ -504,13 +549,14 @@ def identify():
         t0 = time.perf_counter()
         audio, sr = decode_audio_bytes(audio_bytes)
         t_decode = time.perf_counter()
-        speech = preprocess(audio, sr)
+        audio16 = to_mono_16k(audio, sr)
+        levels = measure_levels(audio16)
+        speech = trim_silence(audio16)
         t_pre = time.perf_counter()
         speech_sec = speech_seconds(speech)
         if speech_sec < MIN_IDENTIFY_SEC:
             log(f"[identify] too short: speech {speech_sec:.2f}s < {MIN_IDENTIFY_SEC}s")
-            identify_log.append({
-                "time": datetime.now().isoformat(timespec="seconds"),
+            add_identify_log({
                 "source": source,
                 "result": None,
                 "candidate": None,
@@ -518,7 +564,8 @@ def identify():
                 "scores": {},
                 "speech_sec": round(speech_sec, 2),
                 "reason": "too_short",
-            })
+                **levels,
+            }, audio_bytes)
             return jsonify({
                 "name": None,
                 "kana": None,
@@ -535,7 +582,8 @@ def identify():
         t_embed = time.perf_counter()
         log(f"[identify] decode {(t_decode - t0) * 1000:.0f}ms (sr={sr}), "
             f"preprocess {(t_pre - t_decode) * 1000:.0f}ms, "
-            f"embed {(t_embed - t_pre) * 1000:.0f}ms (speech {speech_sec:.1f}s, used {speech_seconds(speech):.1f}s)")
+            f"embed {(t_embed - t_pre) * 1000:.0f}ms (speech {speech_sec:.1f}s, used {speech_seconds(speech):.1f}s, "
+            f"snr {levels['snr_db']}dB)")
     except Exception as e:
         logging.exception("[identify] get_embedding failed")
         return jsonify({"error": str(e)}), 500
@@ -548,8 +596,7 @@ def identify():
     log(f"[identify] similarity search took {time.perf_counter() - t0:.3f} sec")
 
     accepted = best_name is not None and best_score >= SCORE_THRESHOLD
-    identify_log.append({
-        "time": datetime.now().isoformat(timespec="seconds"),
+    add_identify_log({
         "source": source,
         "result": best_name if accepted else None,
         "candidate": best_name,
@@ -557,7 +604,8 @@ def identify():
         "scores": {name: round(score, 3) for name, score in scores.items()},
         "speech_sec": round(speech_sec, 2),
         "reason": None if accepted else "below_threshold",
-    })
+        **levels,
+    }, audio_bytes)
     score_list = [
         {"name": name, "kana": metadata.get(name, {}).get("kana", name), "score": round(score, 3)}
         for name, score in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
@@ -596,14 +644,43 @@ def get_identify_log():
         "threshold": SCORE_THRESHOLD,
         "people": [{"name": name, "kana": metadata.get(name, {}).get("kana", name)}
                    for name in sorted(profiles)],
-        "entries": list(identify_log),
+        "entries": [{**e, "has_audio": e["id"] in identify_audio} for e in list(identify_log)],
     })
 
 @app.route("/identify_log", methods=["DELETE"])
 def clear_identify_log():
     require_auth()
-    identify_log.clear()
+    with identify_lock:
+        identify_log.clear()
+        identify_audio.clear()
     return jsonify({"status": "cleared"})
+
+
+def get_identify_audio(entry_id: int) -> dict:
+    with identify_lock:
+        item = identify_audio.get(entry_id)
+    if item is None:
+        abort(404, description="録音が残っていません（古い記録の録音は順に削除されます）")
+    return item
+
+
+@app.route("/identify_log/<int:entry_id>/audio", methods=["GET"])
+def identify_log_audio(entry_id):
+    """識別で届いた録音を WAV で返す。kind=raw: 元の音 / processed: モデルに入力した音"""
+    require_auth()
+    item = get_identify_audio(entry_id)
+    kind = request.args.get("kind", "raw")
+    audio, sr = decode_audio_bytes(item["bytes"])
+    if kind == "raw":
+        data = wav_bytes(audio, sr)
+    elif kind == "processed":
+        speech = preprocess(audio, sr)
+        if MAX_IDENTIFY_SEC > 0:
+            speech = speech[:int(MAX_IDENTIFY_SEC * SAMPLE_RATE)]
+        data = wav_bytes(speech, SAMPLE_RATE)
+    else:
+        return jsonify({"error": "kind は raw / processed のいずれかです"}), 400
+    return send_file(io.BytesIO(data), mimetype="audio/wav")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080, debug=False)

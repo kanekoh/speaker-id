@@ -149,6 +149,7 @@ input:focus-visible, button:focus-visible, a:focus-visible {
 .segmented label:has(input:disabled) { opacity: 0.45; cursor: not-allowed; }
 .segmented label:has(input:focus-visible) { outline: 2px solid var(--focus); outline-offset: -2px; }
 .row-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.data-table td > .row-actions:only-child { flex-wrap: nowrap; margin-top: 0; }
 .check { display: inline-flex; align-items: center; gap: 6px; font-size: 0.9em; color: var(--text-secondary); }
 
 .read-aloud {
