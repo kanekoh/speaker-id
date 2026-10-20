@@ -66,7 +66,7 @@
 
     <section class="card">
       <h2>登録済みの話者</h2>
-      <p class="card-sub">一致度は、その録音が同じ人の他の録音とどれだけ似ているかです。極端に低い録音（0.5未満）は、雑音や別人の声が入っている可能性があるので削除をおすすめします。</p>
+      <p class="card-sub">一致度は、その録音が同じ人・同じ録音環境の他の録音とどれだけ似ているかです。極端に低い録音（0.5未満）は、雑音や別人の声が入っている可能性があるので削除をおすすめします。スタックチャンのマイクの録音は、スコア画面のログから登録できます。</p>
       <div id="profiles" class="empty">読み込み中...</div>
     </section>
   </main>
@@ -170,7 +170,7 @@
 
       const table = document.createElement("table");
       table.className = "data-table";
-      table.innerHTML = "<thead><tr><th>話者</th><th>録音日時</th><th>一致度</th><th></th></tr></thead>";
+      table.innerHTML = "<thead><tr><th>話者</th><th>録音日時</th><th>録音環境</th><th>一致度</th><th></th></tr></thead>";
       const tbody = document.createElement("tbody");
       for (const p of people) {
         p.samples.forEach((sample, i) => {
@@ -201,6 +201,11 @@
           }
           const when = document.createElement("td");
           when.textContent = fmtId(sample.id);
+          const env = document.createElement("td");
+          const badge = document.createElement("span");
+          badge.className = "badge";
+          badge.textContent = sample.env === "device" ? "スタックチャン" : "ブラウザ";
+          env.appendChild(badge);
           const score = document.createElement("td");
           score.className = "num" + (sample.consistency !== null && sample.consistency < 0.5 ? " low" : "");
           score.textContent = sample.consistency === null ? "–" : sample.consistency.toFixed(3);
@@ -212,7 +217,7 @@
             `/profiles/${encodeURIComponent(p.name)}/samples/${encodeURIComponent(sample.id)}`,
             `${fmtId(sample.id)} の録音を削除しますか？`);
           action.appendChild(del);
-          tr.append(when, score, action);
+          tr.append(when, env, score, action);
           tbody.appendChild(tr);
         });
       }
@@ -286,6 +291,7 @@
       formData.append("name", name);
       formData.append("kana", kana);
       formData.append("mode", mode);
+      formData.append("env", "browser");
 
       setStatus("送信中...");
       try {

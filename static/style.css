@@ -180,13 +180,19 @@ input:focus-visible, button:focus-visible, a:focus-visible {
 .data-table .low { color: var(--critical); font-weight: bold; }
 .empty { color: var(--text-muted); font-size: 0.9em; }
 
-/* ---- トークン入力ダイアログ（auth.js） ---- */
-.auth-backdrop {
+/* ---- ダイアログ（トークン入力・録音の登録など） ---- */
+.modal-backdrop, .auth-backdrop {
   position: fixed; inset: 0; z-index: 10;
   background: rgba(0, 0, 0, 0.35);
   display: flex; align-items: flex-start; justify-content: center;
   padding: 20vh 16px 0;
 }
-.auth-dialog { width: 100%; max-width: 380px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2); }
-.auth-dialog .field { max-width: none; }
+.modal-backdrop[hidden] { display: none; }
+.modal, .auth-dialog { width: 100%; max-width: 380px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2); }
+.modal .field, .auth-dialog .field { max-width: none; }
+.modal .actions { justify-content: flex-end; margin-bottom: 0; }
+.badge {
+  display: inline-block; font-size: 0.8em; padding: 0 8px; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--text-secondary); background: var(--surface-2);
+}
 .auth-error { color: var(--critical); font-size: 0.9em; min-height: 1.4em; margin: 4px 0 0; }

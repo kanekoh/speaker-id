@@ -46,6 +46,36 @@
     </section>
   </main>
 
+  <div class="modal-backdrop" id="registerDialog" hidden>
+    <form class="card modal" role="dialog" aria-modal="true" aria-labelledby="registerTitle">
+      <h2 id="registerTitle">この録音を登録に使う</h2>
+      <p class="card-sub" id="registerInfo"></p>
+      <div class="segmented" role="radiogroup" aria-label="登録のしかた">
+        <label><input type="radio" name="regMode" value="add" id="regModeAdd" checked> 登録済みの人に追加</label>
+        <label><input type="radio" name="regMode" value="new" id="regModeNew"> 新しい人を登録</label>
+      </div>
+      <div id="regAddFields" class="field">
+        <label for="regPerson">誰の声か</label>
+        <select id="regPerson"></select>
+      </div>
+      <div id="regNewFields" hidden>
+        <div class="field">
+          <label for="regName">識別名（半角英数字）</label>
+          <input type="text" id="regName" placeholder="例: tanaka">
+        </div>
+        <div class="field">
+          <label for="regKana">表示名</label>
+          <input type="text" id="regKana" placeholder="例: たなかさん">
+        </div>
+      </div>
+      <p class="status" id="registerStatus" role="status"></p>
+      <div class="actions">
+        <button type="button" class="btn" id="registerCancel">閉じる</button>
+        <button type="submit" class="btn btn-primary" id="registerSubmit">登録する</button>
+      </div>
+    </form>
+  </div>
+
   <script src="/static/auth.js"></script>
   <script src="/static/score-charts.js"></script>
   <script>
@@ -56,6 +86,7 @@
       const res = await Auth.authFetch("/identify_log");
       if (!res.ok) return;
       const data = await res.json();
+      latestPeople = data.people;
 
       const last = data.entries[data.entries.length - 1];
       if (last) {
@@ -104,6 +135,73 @@
       player.play();
     }
 
+    // ---- 録音を登録に使う ----
+    const dialog = document.getElementById("registerDialog");
+    const regModeAdd = document.getElementById("regModeAdd");
+    const regPerson = document.getElementById("regPerson");
+    const registerStatus = document.getElementById("registerStatus");
+    let dialogEntry = null;
+    let latestPeople = [];
+
+    function setRegMode(mode) {
+      document.getElementById(mode === "add" ? "regModeAdd" : "regModeNew").checked = true;
+      document.getElementById("regAddFields").hidden = mode !== "add";
+      document.getElementById("regNewFields").hidden = mode !== "new";
+    }
+    document.getElementById("regModeAdd").onchange = () => setRegMode("add");
+    document.getElementById("regModeNew").onchange = () => setRegMode("new");
+
+    function openRegisterDialog(entry) {
+      dialogEntry = entry;
+      const env = entry.source === "test" ? "ブラウザ" : "スタックチャン";
+      document.getElementById("registerInfo").textContent =
+        `${entry.time.replace("T", " ")}・送信元 ${entry.source}（${env}の録音として登録）・声の長さ ${entry.speech_sec ?? "–"}秒`;
+      regPerson.replaceChildren(...latestPeople.map((p) => {
+        const opt = document.createElement("option");
+        opt.value = p.name;
+        opt.textContent = `${p.kana}（${p.name}）`;
+        return opt;
+      }));
+      // 判定結果（なければ最有力候補）を最初から選んでおく
+      const guess = entry.result || entry.candidate;
+      if (guess) regPerson.value = guess;
+      regModeAdd.disabled = latestPeople.length === 0;
+      setRegMode(latestPeople.length ? "add" : "new");
+      registerStatus.textContent = "";
+      registerStatus.className = "status";
+      document.getElementById("registerSubmit").disabled = false;
+      dialog.hidden = false;
+    }
+
+    document.getElementById("registerCancel").onclick = () => { dialog.hidden = true; };
+    dialog.querySelector("form").onsubmit = async (e) => {
+      e.preventDefault();
+      const mode = regModeAdd.checked ? "add" : "new";
+      const body = mode === "add"
+        ? { mode, name: regPerson.value }
+        : { mode, name: document.getElementById("regName").value.trim(),
+            kana: document.getElementById("regKana").value.trim() };
+      registerStatus.textContent = "登録中...";
+      registerStatus.className = "status";
+      const res = await Auth.authFetch(`/identify_log/${dialogEntry.id}/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const result = await res.json();
+      if (res.ok) {
+        let msg = `✓ ${result.kana}（${result.name}）に追加しました・${result.num_samples}件目`;
+        if (result.consistency !== null) msg += `・既存の登録との一致度 ${result.consistency.toFixed(3)}`;
+        registerStatus.textContent = msg;
+        registerStatus.className = "status is-ok";
+        document.getElementById("registerSubmit").disabled = true;
+        load();
+      } else {
+        registerStatus.textContent = `✗ ${result.error || `HTTP ${res.status}`}`;
+        registerStatus.className = "status is-error";
+      }
+    };
+
     function renderActions(entry) {
       if (!entry.has_audio) return null;
       const box = document.createElement("div");
@@ -118,6 +216,18 @@
         if (playingButton && playingButton.dataset.key === b.dataset.key) playingButton = b;
         b.onclick = () => play(entry.id, kind, b);
         box.appendChild(b);
+      }
+      if (entry.registered_to) {
+        const done = document.createElement("span");
+        done.className = "badge";
+        done.textContent = `登録済み: ${entry.registered_to}`;
+        box.appendChild(done);
+      } else {
+        const reg = document.createElement("button");
+        reg.className = "btn btn-small";
+        reg.textContent = "登録…";
+        reg.onclick = () => openRegisterDialog(entry);
+        box.appendChild(reg);
       }
       return box;
     }

@@ -221,8 +221,14 @@ if os.path.exists(META_FILE):
 else:
     metadata = {}
 
-samples = {}   # name -> {sample_id: 正規化済み埋め込み}
-profiles = {}  # name -> 全サンプルの平均（正規化済み）
+# 録音環境。マイクや録音経路が違うと同じ人でもスコアが下がるので、環境ごとに平均を作る
+ENV_BROWSER = "browser"   # ブラウザ（PC・スマホのマイク）
+ENV_DEVICE = "device"     # スタックチャン（M5Stack）などの端末
+ENVS = (ENV_BROWSER, ENV_DEVICE)
+
+samples = {}      # name -> {sample_id: 正規化済み埋め込み}
+sample_envs = {}  # name -> {sample_id: 録音環境}
+profiles = {}     # name -> 環境ごとの平均を並べた配列 (環境数, 次元)
 
 
 def person_dir(name: str) -> str:
@@ -257,19 +263,44 @@ def load_sample_embedding(wav_path: str) -> np.ndarray:
     return embedding
 
 
+def env_of_source(source: str) -> str:
+    """識別リクエストの source から録音環境を決める（識別テスト画面だけがブラウザ）"""
+    return ENV_BROWSER if source == "test" else ENV_DEVICE
+
+
+def read_sample_env(wav_path: str) -> str:
+    """録音の横の <sample_id>.json から録音環境を読む（無ければ従来どおりブラウザ）"""
+    try:
+        with open(f"{wav_path[:-4]}.json") as f:
+            env = json.load(f).get("env")
+        return env if env in ENVS else ENV_BROWSER
+    except (OSError, ValueError):
+        return ENV_BROWSER
+
+
+def profile_score(embedding: np.ndarray, profile: np.ndarray) -> float:
+    """環境ごとの平均のうち、最も近いものとのコサイン類似度"""
+    return float(np.max(np.atleast_2d(profile) @ embedding))
+
+
 def remove_sample_files(name: str, sample_id: str):
-    """サンプルの wav と埋め込みキャッシュ（.npy）を削除する"""
+    """サンプルの wav と埋め込みキャッシュ（.npy）・環境（.json）を削除する"""
     for filename in os.listdir(person_dir(name)):
         if filename.startswith(sample_id + "."):
             os.remove(os.path.join(person_dir(name), filename))
 
 
 def refresh_profile(name: str):
-    """サンプルの平均からプロファイルを作り直す。サンプルが無ければ削除"""
+    """環境ごとのサンプルの平均からプロファイルを作り直す。サンプルが無ければ削除"""
     if samples.get(name):
-        profiles[name] = centroid(samples[name].values())
+        envs = sample_envs.get(name, {})
+        by_env = {}
+        for sample_id, emb in samples[name].items():
+            by_env.setdefault(envs.get(sample_id, ENV_BROWSER), []).append(emb)
+        profiles[name] = np.stack([centroid(by_env[env]) for env in ENVS if env in by_env])
     else:
         samples.pop(name, None)
+        sample_envs.pop(name, None)
         profiles.pop(name, None)
 
 
@@ -299,9 +330,9 @@ def migrate_legacy_profiles():
 
 def load_profiles():
     """profiles/ から全登録者のサンプルを読み込み、プロファイルを作る"""
-    global samples, profiles
+    global samples, sample_envs, profiles
     migrate_legacy_profiles()
-    samples, profiles = {}, {}
+    samples, sample_envs, profiles = {}, {}, {}
     for name in sorted(os.listdir(PROFILE_DIR)):
         if not (NAME_RE.match(name) and os.path.isdir(person_dir(name))):
             continue
@@ -312,9 +343,10 @@ def load_profiles():
                 continue
             if not filename.endswith(".wav"):
                 continue
+            wav_path = os.path.join(person_dir(name), filename)
             try:
-                samples.setdefault(name, {})[filename[:-4]] = \
-                    load_sample_embedding(os.path.join(person_dir(name), filename))
+                samples.setdefault(name, {})[filename[:-4]] = load_sample_embedding(wav_path)
+                sample_envs.setdefault(name, {})[filename[:-4]] = read_sample_env(wav_path)
             except Exception as e:
                 logging.error(f"[startup] Could not load '{name}/{filename}': {e}")
         refresh_profile(name)
@@ -390,84 +422,86 @@ def restore():
     load_profiles()
     return jsonify({"status": "restored"})
 
-@app.route("/register", methods=["POST"])
-def register():
-    print("[register] ---- request received ----", flush=True)
-    require_auth()
-    print("[register] auth passed", flush=True)
+def add_sample(name: str, kana: str, mode: str, audio: np.ndarray, sr: int, env: str):
+    """録音を name の登録に加える。(レスポンス本文, ステータスコード) を返す
+
+    mode: "new" は新しい人のみ、"add" は登録済みの人のみ、"" はどちらでも（従来どおり）
+    """
     start_time = time.perf_counter()
-
-    if "audio" not in request.files or "name" not in request.form:
-        return jsonify({"error": "audio and name are required"}), 400
-
-    file = request.files["audio"]
-    name = request.form["name"].strip()
-    kana = request.form.get("kana", "").strip()
-
     if not name:
-        return jsonify({"error": "Name is empty"}), 400
+        return {"error": "Name is empty"}, 400
     if not NAME_RE.match(name):
-        return jsonify({"error": "識別名は半角英数字・_・- のみ使えます"}), 400
+        return {"error": "識別名は半角英数字・_・- のみ使えます"}, 400
     # 打ち間違いで別人として登録したり、他人の録音に混ぜたりしないための確認
-    # mode を省略した場合は従来どおり（あれば追加、なければ新規）
-    mode = request.form.get("mode", "")
     if mode == "new" and name in samples:
-        return jsonify({"error": f"識別名「{name}」はすでに登録されています。"
-                                 "この人に録音を足す場合は「登録済みの人に追加」を選んでください"}), 409
+        return {"error": f"識別名「{name}」はすでに登録されています。"
+                         "この人に録音を足す場合は「登録済みの人に追加」を選んでください"}, 409
     if mode == "add" and name not in samples:
-        return jsonify({"error": f"識別名「{name}」は登録されていません"}), 404
+        return {"error": f"識別名「{name}」は登録されていません"}, 404
+    if env not in ENVS:
+        return {"error": f"env は {' / '.join(ENVS)} のいずれかです"}, 400
+
+    speech = preprocess(audio, sr)
+    speech_sec = speech_seconds(speech)
+    if speech_sec < MIN_REGISTER_SEC:
+        return {
+            "error": f"声の部分が短すぎます（{speech_sec:.1f}秒）。"
+                     f"{MIN_REGISTER_SEC:.0f}秒以上話してください",
+            "speech_sec": round(speech_sec, 2),
+        }, 400
+    embedding = embed(speech)
 
     os.makedirs(person_dir(name), exist_ok=True)
     sample_id = new_sample_id()
     save_path = os.path.join(person_dir(name), f"{sample_id}.wav")
+    sf.write(save_path, audio, sr)
+    with open(f"{save_path[:-4]}.json", "w") as f:
+        json.dump({"env": env}, f)
+    np.save(cache_path_for(save_path), embedding)
 
-    try:
-        audio, sr = decode_audio_bytes(file.read())
-        sf.write(save_path, audio, sr)
-    except Exception as e:
-        logging.exception("[register] audio conversion failed")
-        return jsonify({"error": f"音声変換失敗: {e}"}), 500
-
-    try:
-        t0 = time.perf_counter()
-        speech = preprocess(*sf.read(save_path, dtype='float32'))
-        speech_sec = speech_seconds(speech)
-        if speech_sec < MIN_REGISTER_SEC:
-            os.remove(save_path)
-            return jsonify({
-                "error": f"声の部分が短すぎます（{speech_sec:.1f}秒）。"
-                         f"{MIN_REGISTER_SEC:.0f}秒以上話してください",
-                "speech_sec": round(speech_sec, 2),
-            }), 400
-        embedding = embed(speech)
-        np.save(cache_path_for(save_path), embedding)
-        print(f"[register] get_embedding took {time.perf_counter() - t0:.3f} sec (speech {speech_sec:.1f}s)")
-    except Exception as e:
-        logging.exception("[register] get_embedding failed")
-        os.remove(save_path)
-        return jsonify({"error": str(e)}), 500
-
-    # 既存サンプルとの一致度（低ければ録り直しの目安）
-    existing = samples.get(name, {})
-    consistency = round(float(np.dot(embedding, centroid(existing.values()))), 3) if existing else None
+    # 既存の登録との一致度（識別と同じく、環境ごとの平均のうち最も近いもの）
+    consistency = round(profile_score(embedding, profiles[name]), 3) if name in profiles else None
 
     samples.setdefault(name, {})[sample_id] = embedding
+    sample_envs.setdefault(name, {})[sample_id] = env
     refresh_profile(name)
 
     if kana or name not in metadata:
         metadata[name] = {"kana": kana or name}
     save_metadata()
 
-    print(f"[register] Total time: {time.perf_counter() - start_time:.3f} sec")
-    return jsonify({
+    log(f"[register] {name}/{sample_id} env={env} speech {speech_sec:.1f}s "
+        f"consistency={consistency} ({time.perf_counter() - start_time:.3f} sec)")
+    return {
         "status": "ok",
         "name": name,
         "kana": metadata[name]["kana"],
         "sample_id": sample_id,
+        "env": env,
         "num_samples": len(samples[name]),
         "consistency": consistency,
         "speech_sec": round(speech_sec, 2),
-    })
+    }, 200
+
+
+@app.route("/register", methods=["POST"])
+def register():
+    require_auth()
+    if "audio" not in request.files or "name" not in request.form:
+        return jsonify({"error": "audio and name are required"}), 400
+    try:
+        audio, sr = decode_audio_bytes(request.files["audio"].read())
+    except Exception as e:
+        logging.exception("[register] audio conversion failed")
+        return jsonify({"error": f"音声変換失敗: {e}"}), 500
+    body, status = add_sample(
+        name=request.form["name"].strip(),
+        kana=request.form.get("kana", "").strip(),
+        mode=request.form.get("mode", ""),
+        audio=audio, sr=sr,
+        env=request.form.get("env", ENV_BROWSER),
+    )
+    return jsonify(body), status
 
 
 @app.route("/profiles", methods=["GET"])
@@ -477,10 +511,15 @@ def list_profiles():
     people = []
     for name in sorted(samples):
         items = []
+        envs = sample_envs.get(name, {})
         for sample_id, emb in samples[name].items():
-            others = [e for sid, e in samples[name].items() if sid != sample_id]
+            env = envs.get(sample_id, ENV_BROWSER)
+            # 一致度は同じ環境の他の録音と比べる（環境が違うとそれだけで低く出るため）
+            others = [e for sid, e in samples[name].items()
+                      if sid != sample_id and envs.get(sid, ENV_BROWSER) == env]
             items.append({
                 "id": sample_id,
+                "env": env,
                 "consistency": round(float(np.dot(emb, centroid(others))), 3) if others else None,
             })
         people.append({
@@ -512,6 +551,7 @@ def delete_sample(name, sample_id):
         return jsonify({"error": "not found"}), 404
     remove_sample_files(name, sample_id)
     del samples[name][sample_id]
+    sample_envs.get(name, {}).pop(sample_id, None)
     refresh_profile(name)
     if name not in samples:
         shutil.rmtree(person_dir(name), ignore_errors=True)
@@ -589,8 +629,7 @@ def identify():
         return jsonify({"error": str(e)}), 500
 
     t0 = time.perf_counter()
-    scores = {name: float(np.dot(embedding, prof_embedding))
-              for name, prof_embedding in profiles.items()}
+    scores = {name: profile_score(embedding, profile) for name, profile in profiles.items()}
     best_name = max(scores, key=scores.get) if scores else None
     best_score = scores[best_name] if best_name else -1
     log(f"[identify] similarity search took {time.perf_counter() - t0:.3f} sec")
@@ -644,7 +683,10 @@ def get_identify_log():
         "threshold": SCORE_THRESHOLD,
         "people": [{"name": name, "kana": metadata.get(name, {}).get("kana", name)}
                    for name in sorted(profiles)],
-        "entries": [{**e, "has_audio": e["id"] in identify_audio} for e in list(identify_log)],
+        "entries": [{**e,
+                     "has_audio": e["id"] in identify_audio,
+                     "registered_to": identify_audio.get(e["id"], {}).get("registered_to")}
+                    for e in list(identify_log)],
     })
 
 @app.route("/identify_log", methods=["DELETE"])
@@ -662,6 +704,27 @@ def get_identify_audio(entry_id: int) -> dict:
     if item is None:
         abort(404, description="録音が残っていません（古い記録の録音は順に削除されます）")
     return item
+
+
+@app.route("/identify_log/<int:entry_id>/register", methods=["POST"])
+def register_from_identify_log(entry_id):
+    """識別で届いた録音（スタックチャンのマイクの音など）をそのまま登録に使う"""
+    require_auth()
+    item = get_identify_audio(entry_id)
+    if item.get("registered_to"):
+        return jsonify({"error": f"この録音はすでに {item['registered_to']} として登録済みです"}), 409
+    body = request.get_json(silent=True) or {}
+    audio, sr = decode_audio_bytes(item["bytes"])
+    result, status = add_sample(
+        name=str(body.get("name", "")).strip(),
+        kana=str(body.get("kana", "")).strip(),
+        mode=body.get("mode", "add"),
+        audio=audio, sr=sr,
+        env=env_of_source(item["source"]),
+    )
+    if status == 200:
+        item["registered_to"] = result["name"]
+    return jsonify(result), status
 
 
 @app.route("/identify_log/<int:entry_id>/audio", methods=["GET"])

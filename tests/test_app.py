@@ -74,6 +74,7 @@ def isolated_profiles(tmp_path, monkeypatch):
     monkeypatch.setattr(app_module, "META_FILE", str(tmp_path / "metadata.json"))
     monkeypatch.setattr(app_module, "metadata", {})
     monkeypatch.setattr(app_module, "samples", {})
+    monkeypatch.setattr(app_module, "sample_envs", {})
     monkeypatch.setattr(app_module, "profiles", {})
     return tmp_path
 
@@ -338,6 +339,95 @@ class TestProfiles:
         _register(client, "alice")
         resp = client.delete("/profiles/alice/samples/..%2Fmetadata", headers=AUTH)
         assert resp.status_code == 404
+
+
+# -----------------------------------------------------------------------
+# 録音環境ごとのプロファイル・ログの録音からの登録
+# -----------------------------------------------------------------------
+def _identify_entry(client, source="api", wav=None):
+    """/identify を呼び、履歴に追加されたエントリを返す"""
+    client.post("/identify", headers=AUTH,
+                data={"audio": (wav or _make_wav(), "q.wav", "audio/wav"), "source": source},
+                content_type="multipart/form-data")
+    return app_module.identify_log[-1]
+
+
+class TestEnvironments:
+    def test_browser_register_records_env(self, client, isolated_profiles):
+        """登録画面からの登録は browser として記録され、一覧にも出る"""
+        sample_id = _register(client, "alice").get_json()["sample_id"]
+        assert json.loads((isolated_profiles / "alice" / f"{sample_id}.json").read_text()) == {"env": "browser"}
+        people = client.get("/profiles", headers=AUTH).get_json()["people"]
+        assert people[0]["samples"][0]["env"] == "browser"
+
+    def test_register_from_identify_log(self, client, isolated_profiles):
+        """端末からの識別の録音を登録すると device として加わり、環境ごとの平均ができる"""
+        _register(client, "alice")
+        entry = _identify_entry(client, source="stackchan")
+        resp = client.post(f"/identify_log/{entry['id']}/register", headers=AUTH, json={"name": "alice"})
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["env"] == "device"
+        assert data["num_samples"] == 2
+        assert app_module.profiles["alice"].shape[0] == 2  # browser と device の 2 つ
+        log = client.get("/identify_log", headers=AUTH).get_json()["entries"]
+        assert [e["registered_to"] for e in log if e["id"] == entry["id"]] == ["alice"]
+
+    def test_register_from_identify_log_twice_is_rejected(self, client, isolated_profiles):
+        _register(client, "alice")
+        entry = _identify_entry(client)
+        client.post(f"/identify_log/{entry['id']}/register", headers=AUTH, json={"name": "alice"})
+        resp = client.post(f"/identify_log/{entry['id']}/register", headers=AUTH, json={"name": "alice"})
+        assert resp.status_code == 409
+        assert len(app_module.samples["alice"]) == 2
+
+    def test_register_from_identify_log_validation(self, client, isolated_profiles):
+        _register(client, "alice")
+        entry = _identify_entry(client)
+        url = f"/identify_log/{entry['id']}/register"
+        assert client.post(url, json={"name": "alice"}).status_code == 401
+        # 既定は「登録済みの人に追加」なので、未登録の名前は 404
+        assert client.post(url, headers=AUTH, json={"name": "bob"}).status_code == 404
+        assert client.post("/identify_log/999999/register", headers=AUTH,
+                           json={"name": "alice"}).status_code == 404
+        # mode=new なら新しい人として登録できる
+        resp = client.post(url, headers=AUTH, json={"name": "bob", "kana": "ボブ", "mode": "new"})
+        assert resp.status_code == 200 and resp.get_json()["kana"] == "ボブ"
+
+    def test_short_identify_audio_cannot_be_registered(self, client, isolated_profiles):
+        """登録の最低秒数に満たない録音は 400 で、登録済みにもならない"""
+        _register(client, "alice")
+        entry = _identify_entry(client, wav=_make_speech_wav(1.5, silence_sec=1.0))
+        resp = client.post(f"/identify_log/{entry['id']}/register", headers=AUTH, json={"name": "alice"})
+        assert resp.status_code == 400
+        assert app_module.identify_audio[entry["id"]].get("registered_to") is None
+
+    def test_profile_score_uses_closest_environment(self):
+        """プロファイルは環境ごとの平均の組で、最も近いものとのスコアを使う"""
+        a = np.zeros(4, dtype=np.float32); a[0] = 1
+        b = np.zeros(4, dtype=np.float32); b[1] = 1
+        assert app_module.profile_score(b, np.stack([a, b])) == pytest.approx(1.0)
+        assert app_module.profile_score(b, a) == pytest.approx(0.0)  # 1 次元（環境 1 つ）でも可
+
+    def test_consistency_compares_within_same_env(self, client, isolated_profiles):
+        """一覧の一致度は同じ環境の録音どうしで比べる（環境が 1 本ずつなら比較対象なし）"""
+        _register(client, "alice")
+        entry = _identify_entry(client)
+        client.post(f"/identify_log/{entry['id']}/register", headers=AUTH, json={"name": "alice"})
+        samples = client.get("/profiles", headers=AUTH).get_json()["people"][0]["samples"]
+        assert sorted(s["env"] for s in samples) == ["browser", "device"]
+        assert all(s["consistency"] is None for s in samples)
+
+    def test_env_is_restored_on_load_and_removed_with_sample(self, client, isolated_profiles):
+        _register(client, "alice")
+        entry = _identify_entry(client)
+        sample_id = client.post(f"/identify_log/{entry['id']}/register", headers=AUTH,
+                                json={"name": "alice"}).get_json()["sample_id"]
+        app_module.load_profiles()
+        assert app_module.sample_envs["alice"][sample_id] == "device"
+        client.delete(f"/profiles/alice/samples/{sample_id}", headers=AUTH)
+        assert not (isolated_profiles / "alice" / f"{sample_id}.json").exists()
+        assert app_module.profiles["alice"].shape[0] == 1
 
 
 # -----------------------------------------------------------------------
