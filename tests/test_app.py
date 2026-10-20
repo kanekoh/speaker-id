@@ -710,6 +710,30 @@ class TestIdentifyLog:
         app_module.load_identify_log()
         assert [e["id"] for e in app_module.identify_log] == [5]
 
+    def test_denoise_compare_and_audio(self, client, monkeypatch):
+        """ノイズ除去した場合のスコアと、除去後の音を返す（識別には使わない）"""
+        monkeypatch.setattr(app_module, "profiles", {"alice": np.ones(192, dtype=np.float32)})
+        monkeypatch.setattr(app_module, "denoise", lambda x: x * 0.5)
+        client.delete("/identify_log", headers=AUTH)
+        self._identify(client)
+        entry_id = app_module.identify_log[-1]["id"]
+        resp = client.get(f"/identify_log/{entry_id}/denoise_compare", headers=AUTH)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert set(data["before"]["scores"]) == {"alice"}
+        assert set(data["after"]["scores"]) == {"alice"}
+        assert "snr_db" in data["after"]
+        resp = client.get(f"/identify_log/{entry_id}/audio?kind=denoised", headers=AUTH)
+        assert resp.status_code == 200 and resp.mimetype == "audio/wav"
+
+    def test_denoise_without_model_returns_503(self, client, monkeypatch):
+        monkeypatch.setattr(app_module, "profiles", {"alice": np.ones(192, dtype=np.float32)})
+        monkeypatch.setattr(app_module, "DENOISE_MODEL_PATH", "/nonexistent.onnx")
+        monkeypatch.setattr(app_module, "_denoiser", None)
+        self._identify(client)
+        entry_id = app_module.identify_log[-1]["id"]
+        assert client.get(f"/identify_log/{entry_id}/denoise_compare", headers=AUTH).status_code == 503
+
     def test_scores_page_accessible(self, client):
         """GET /scores.html は認証不要でページが返る"""
         assert client.get("/scores.html").status_code == 200

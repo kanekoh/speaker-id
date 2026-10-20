@@ -16,9 +16,13 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
+# ノイズ除去モデル（GTCRN）。スコア画面での試聴・比較専用で、識別には使わない
+ARG DENOISE_MODEL_URL=https://github.com/k2-fsa/sherpa-onnx/releases/download/speech-enhancement-models/gtcrn_simple.onnx
+
 # 話者識別モデルをダウンロード
 RUN mkdir -p /app/model && \
     wget -q -O /app/model/model.onnx "${SPEAKER_MODEL_URL}"
+RUN wget -q -O /app/model/gtcrn_simple.onnx "${DENOISE_MODEL_URL}"
 
 COPY . /app
 

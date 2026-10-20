@@ -148,6 +148,11 @@ input:focus-visible, button:focus-visible, a:focus-visible {
 .segmented label:has(input:checked) { background: var(--accent); color: var(--accent-text); }
 .segmented label:has(input:disabled) { opacity: 0.45; cursor: not-allowed; }
 .segmented label:has(input:focus-visible) { outline: 2px solid var(--focus); outline-offset: -2px; }
+.compare-panel {
+  background: var(--surface-2); border-radius: 6px;
+  padding: 10px 14px; margin: 0 0 12px;
+}
+.compare-panel .data-table { width: auto; margin-bottom: 8px; }
 .row-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
 .data-table td > .row-actions:only-child { flex-wrap: nowrap; margin-top: 0; }
 .check { display: inline-flex; align-items: center; gap: 6px; font-size: 0.9em; color: var(--text-secondary); }

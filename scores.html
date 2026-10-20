@@ -41,7 +41,8 @@
 
     <section class="card viz-root">
       <h2>ログ</h2>
-      <p class="card-sub">直近の記録をサーバーに保存しています（再起動しても残ります）。録音は直近の約200件まで再生・登録に使えます。「元」は届いた音そのまま、「処理後」は無音を除いてモデルに入力した音です。SN比（声とノイズの大きさの差）が15dB未満の録音は ⚠ を付けています。</p>
+      <p class="card-sub">直近の記録をサーバーに保存しています（再起動しても残ります）。録音は直近の約200件まで再生・登録に使えます。「元」は届いた音そのまま、「処理後」は無音を除いてモデルに入力した音、「除去後」はノイズ除去をかけた音です（ノイズ除去は比較用で、識別には使っていません）。SN比（声とノイズの大きさの差）が15dB未満の録音は ⚠ を付けています。</p>
+      <div id="comparePanel" class="compare-panel" hidden></div>
       <div id="logTable"></div>
     </section>
   </main>
@@ -135,6 +136,52 @@
       player.play();
     }
 
+    // ---- ノイズ除去した場合のスコアとの比較 ----
+    async function showDenoiseCompare(entry) {
+      const panel = document.getElementById("comparePanel");
+      panel.hidden = false;
+      panel.textContent = "ノイズ除去した場合のスコアを計算中...";
+      const res = await Auth.authFetch(`/identify_log/${entry.id}/denoise_compare`);
+      const data = await res.json();
+      if (!res.ok) { panel.textContent = `比較できません: ${data.error || res.status}`; return; }
+
+      const kana = Object.fromEntries(latestPeople.map((p) => [p.name, p.kana]));
+      const head = document.createElement("p");
+      head.className = "card-sub";
+      head.textContent = `${entry.time.replace("T", " ")}（${entry.source}）の録音をノイズ除去した場合: `
+        + `SN比 ${data.before.snr_db ?? "–"}dB → ${data.after.snr_db ?? "–"}dB・`
+        + `ノイズ除去にかかった時間 ${data.denoise_ms}ms`;
+      const table = document.createElement("table");
+      table.className = "data-table";
+      table.innerHTML = "<thead><tr><th>登録者</th><th>除去なし</th><th>除去あり</th><th>差</th></tr></thead>";
+      const tbody = document.createElement("tbody");
+      const names = Object.keys({ ...data.before.scores, ...data.after.scores })
+        .sort((a, b) => (data.before.scores[b] ?? -1) - (data.before.scores[a] ?? -1));
+      for (const name of names) {
+        const before = data.before.scores[name], after = data.after.scores[name];
+        const diff = before != null && after != null ? after - before : null;
+        const tr = document.createElement("tr");
+        for (const [text, cls] of [
+          [`${kana[name] || name}（${name}）`, ""],
+          [before != null ? before.toFixed(3) : "–", "num"],
+          [after != null ? after.toFixed(3) : "–", "num"],
+          [diff != null ? `${diff >= 0 ? "+" : ""}${diff.toFixed(3)}` : "–", "num"],
+        ]) {
+          const td = document.createElement("td");
+          td.textContent = text;
+          if (cls) td.className = cls;
+          tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+      }
+      table.appendChild(tbody);
+      const close = document.createElement("button");
+      close.className = "btn btn-small";
+      close.textContent = "閉じる";
+      close.onclick = () => { panel.hidden = true; };
+      panel.replaceChildren(head, table, close);
+    }
+
     // ---- 録音を登録に使う ----
     const dialog = document.getElementById("registerDialog");
     const regModeAdd = document.getElementById("regModeAdd");
@@ -206,7 +253,7 @@
       if (!entry.has_audio) return null;
       const box = document.createElement("div");
       box.className = "row-actions";
-      for (const [kind, label] of [["raw", "▶ 元"], ["processed", "▶ 処理後"]]) {
+      for (const [kind, label] of [["raw", "▶ 元"], ["processed", "▶ 処理後"], ["denoised", "▶ 除去後"]]) {
         const b = document.createElement("button");
         b.className = "btn btn-small";
         b.dataset.label = label;
@@ -214,7 +261,10 @@
         // 自動更新で表が作り直されても、再生中の表示を保つ
         b.textContent = playingButton && playingButton.dataset.key === b.dataset.key ? "■ 停止" : label;
         if (playingButton && playingButton.dataset.key === b.dataset.key) playingButton = b;
-        b.onclick = () => play(entry.id, kind, b);
+        b.onclick = () => {
+          play(entry.id, kind, b);
+          if (kind === "denoised") showDenoiseCompare(entry);
+        };
         box.appendChild(b);
       }
       if (entry.registered_to) {

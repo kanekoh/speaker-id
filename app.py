@@ -161,6 +161,27 @@ def measure_levels(audio: np.ndarray) -> dict:
             "snr_db": round(speech_db - noise_db, 1)}
 
 
+# ノイズ除去（GTCRN）。試聴・比較専用で、識別には使わない。初めて使うときに読み込む
+DENOISE_MODEL_PATH = os.getenv("SPEAKER_DENOISE_MODEL_PATH", "/app/model/gtcrn_simple.onnx")
+_denoiser = None
+_denoiser_lock = threading.Lock()
+
+
+def denoise(audio16: np.ndarray) -> np.ndarray:
+    """16kHz 波形のノイズを除去する"""
+    global _denoiser
+    with _denoiser_lock:
+        if _denoiser is None:
+            if not os.path.exists(DENOISE_MODEL_PATH):
+                abort(503, description=f"ノイズ除去モデルがありません: {DENOISE_MODEL_PATH}")
+            _denoiser = sherpa_onnx.OfflineSpeechDenoiser(sherpa_onnx.OfflineSpeechDenoiserConfig(
+                model=sherpa_onnx.OfflineSpeechDenoiserModelConfig(
+                    gtcrn=sherpa_onnx.OfflineSpeechDenoiserGtcrnModelConfig(model=DENOISE_MODEL_PATH),
+                    num_threads=NUM_THREADS)))
+        out = _denoiser.run(audio16, SAMPLE_RATE)
+    return np.array(out.samples, dtype=np.float32)
+
+
 def wav_bytes(audio: np.ndarray, sr: int) -> bytes:
     buf = io.BytesIO()
     sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
@@ -819,9 +840,42 @@ def register_from_identify_log(entry_id):
     return jsonify(result), status
 
 
+@app.route("/identify_log/<int:entry_id>/denoise_compare", methods=["GET"])
+def identify_log_denoise_compare(entry_id):
+    """ノイズ除去していたらスコアがどうなったかを計算する（比較用、識別には使わない）"""
+    require_auth()
+    _, audio_bytes = get_identify_audio(entry_id)
+    audio16 = to_mono_16k(*decode_audio_bytes(audio_bytes))
+    t0 = time.perf_counter()
+    denoised = denoise(audio16)
+    denoise_ms = (time.perf_counter() - t0) * 1000
+
+    def scores_of(x):
+        speech = trim_silence(x)
+        if speech_seconds(speech) < MIN_IDENTIFY_SEC:
+            return {}, speech_seconds(speech)
+        if MAX_IDENTIFY_SEC > 0:
+            speech = speech[:int(MAX_IDENTIFY_SEC * SAMPLE_RATE)]
+        emb = embed(speech)
+        return ({name: round(profile_score(emb, p), 3) for name, p in profiles.items()},
+                speech_seconds(speech))
+
+    before, before_sec = scores_of(audio16)
+    after, after_sec = scores_of(denoised)
+    return jsonify({
+        "id": entry_id,
+        "before": {"scores": before, "speech_sec": round(before_sec, 2), **measure_levels(audio16)},
+        "after": {"scores": after, "speech_sec": round(after_sec, 2), **measure_levels(denoised)},
+        "denoise_ms": round(denoise_ms),
+    })
+
+
 @app.route("/identify_log/<int:entry_id>/audio", methods=["GET"])
 def identify_log_audio(entry_id):
-    """識別で届いた録音を WAV で返す。kind=raw: 元の音 / processed: モデルに入力した音"""
+    """識別で届いた録音を WAV で返す
+
+    kind=raw: 元の音 / processed: モデルに入力した音 / denoised: ノイズ除去した音（試聴用）
+    """
     require_auth()
     _, audio_bytes = get_identify_audio(entry_id)
     kind = request.args.get("kind", "raw")
@@ -833,8 +887,10 @@ def identify_log_audio(entry_id):
         if MAX_IDENTIFY_SEC > 0:
             speech = speech[:int(MAX_IDENTIFY_SEC * SAMPLE_RATE)]
         data = wav_bytes(speech, SAMPLE_RATE)
+    elif kind == "denoised":
+        data = wav_bytes(denoise(to_mono_16k(audio, sr)), SAMPLE_RATE)
     else:
-        return jsonify({"error": "kind は raw / processed のいずれかです"}), 400
+        return jsonify({"error": "kind は raw / processed / denoised のいずれかです"}), 400
     return send_file(io.BytesIO(data), mimetype="audio/wav")
 
 if __name__ == "__main__":
