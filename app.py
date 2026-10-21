@@ -305,6 +305,15 @@ def read_sample_env(wav_path: str) -> str:
         return ENV_BROWSER
 
 
+def read_sample_entry_id(wav_path: str):
+    """登録の録音が識別ログのどの録音から来たか（無ければ None）"""
+    try:
+        with open(f"{wav_path[:-4]}.json") as f:
+            return json.load(f).get("entry_id")
+    except (OSError, ValueError):
+        return None
+
+
 def profile_score(embedding: np.ndarray, profile: np.ndarray) -> float:
     """環境ごとの平均のうち、最も近いものとのコサイン類似度"""
     return float(np.max(np.atleast_2d(profile) @ embedding))
@@ -405,6 +414,10 @@ def index():
 def test():
     return send_from_directory(".", "test.html")
 
+@app.route("/inbox.html")
+def inbox_page():
+    return send_from_directory(".", "inbox.html")
+
 @app.route("/scores.html")
 def scores_page():
     return send_from_directory(".", "scores.html")
@@ -449,10 +462,12 @@ def restore():
     load_profiles()
     return jsonify({"status": "restored"})
 
-def add_sample(name: str, kana: str, mode: str, audio: np.ndarray, sr: int, env: str):
+def add_sample(name: str, kana: str, mode: str, audio: np.ndarray, sr: int, env: str,
+               entry_id: int = None):
     """録音を name の登録に加える。(レスポンス本文, ステータスコード) を返す
 
     mode: "new" は新しい人のみ、"add" は登録済みの人のみ、"" はどちらでも（従来どおり）
+    entry_id: 識別ログの録音から登録した場合のログの ID（登録を削除したときに振り分け前に戻すため）
     """
     start_time = time.perf_counter()
     if not name:
@@ -484,7 +499,7 @@ def add_sample(name: str, kana: str, mode: str, audio: np.ndarray, sr: int, env:
     save_path = os.path.join(person_dir(name), f"{sample_id}.wav")
     sf.write(save_path, audio, sr)
     with open(f"{save_path[:-4]}.json", "w") as f:
-        json.dump({"env": env}, f)
+        json.dump({"env": env, **({"entry_id": entry_id} if entry_id is not None else {})}, f)
     np.save(cache_path_for(save_path), embedding)
 
     # 既存の登録との一致度（識別と同じく、環境ごとの平均のうち最も近いもの）
@@ -563,6 +578,8 @@ def delete_profile(name):
     require_auth()
     if not NAME_RE.match(name) or name not in samples:
         return jsonify({"error": "not found"}), 404
+    unassign_entries([read_sample_entry_id(os.path.join(person_dir(name), f"{sid}.wav"))
+                      for sid in samples.get(name, {})])
     shutil.rmtree(person_dir(name), ignore_errors=True)
     samples.pop(name, None)
     refresh_profile(name)
@@ -577,6 +594,7 @@ def delete_sample(name, sample_id):
     if (not NAME_RE.match(name) or not SAMPLE_ID_RE.match(sample_id)
             or sample_id not in samples.get(name, {})):
         return jsonify({"error": "not found"}), 404
+    unassign_entries([read_sample_entry_id(os.path.join(person_dir(name), f"{sample_id}.wav"))])
     remove_sample_files(name, sample_id)
     del samples[name][sample_id]
     sample_envs.get(name, {}).pop(sample_id, None)
@@ -628,7 +646,7 @@ def load_identify_log():
     """保存済みの履歴と録音を読み込み、履歴ファイルを直近分だけに詰め直す"""
     global _identify_ids
     os.makedirs(LOG_AUDIO_DIR, exist_ok=True)
-    entries, registered = OrderedDict(), {}
+    entries, registered, dismissed = OrderedDict(), {}, set()
     if os.path.exists(LOG_FILE):
         with open(LOG_FILE) as f:
             for line in f:
@@ -641,6 +659,12 @@ def load_identify_log():
                     entries[record["id"]] = record
                 elif kind == "registered":
                     registered[record["id"]] = record["name"]
+                elif kind == "unregistered":
+                    registered.pop(record["id"], None)
+                elif kind == "dismissed":
+                    dismissed.add(record["id"])
+                elif kind == "undismissed":
+                    dismissed.discard(record["id"])
     recent = list(entries.values())[-IDENTIFY_LOG_SIZE:]
     with identify_lock:
         identify_log.clear()
@@ -656,6 +680,8 @@ def load_identify_log():
             identify_audio[entry_id] = {"path": path, "source": entries[entry_id]["source"]}
             if entry_id in registered:
                 identify_audio[entry_id]["registered_to"] = registered[entry_id]
+            if entry_id in dismissed:
+                identify_audio[entry_id]["dismissed"] = True
         _prune_identify_audio()
         # 追記で大きくなった履歴ファイルを、残っている分だけで書き直す
         tmp = LOG_FILE + ".tmp"
@@ -666,6 +692,8 @@ def load_identify_log():
                 if item.get("registered_to"):
                     f.write(json.dumps({"type": "registered", "id": entry_id,
                                         "name": item["registered_to"]}, ensure_ascii=False) + "\n")
+                if item.get("dismissed"):
+                    f.write(json.dumps({"type": "dismissed", "id": entry_id}) + "\n")
         os.replace(tmp, LOG_FILE)
         _identify_ids = itertools.count(max([0, *entries]) + 1)
     log(f"[startup] identify log: {len(identify_log)} entries, {len(identify_audio)} recordings ({LOG_DIR})")
@@ -698,7 +726,7 @@ def identify():
         speech_sec = speech_seconds(speech)
         if speech_sec < MIN_IDENTIFY_SEC:
             log(f"[identify] too short: speech {speech_sec:.2f}s < {MIN_IDENTIFY_SEC}s")
-            entry_id = add_identify_log({
+            add_identify_log({
                 "source": source,
                 "result": None,
                 "candidate": None,
@@ -708,7 +736,6 @@ def identify():
                 "reason": "too_short",
                 **levels,
             }, audio_bytes)
-            maybe_enroll(entry_id, audio, sr, speech_sec, levels["snr_db"], source)
             return jsonify({
                 "name": None,
                 "kana": None,
@@ -738,7 +765,7 @@ def identify():
     log(f"[identify] similarity search took {time.perf_counter() - t0:.3f} sec")
 
     accepted = best_name is not None and best_score >= SCORE_THRESHOLD
-    entry_id = add_identify_log({
+    add_identify_log({
         "source": source,
         "result": best_name if accepted else None,
         "candidate": best_name,
@@ -748,7 +775,6 @@ def identify():
         "reason": None if accepted else "below_threshold",
         **levels,
     }, audio_bytes)
-    maybe_enroll(entry_id, audio, sr, speech_sec, levels["snr_db"], source)
     score_list = [
         {"name": name, "kana": metadata.get(name, {}).get("kana", name), "score": round(score, 3)}
         for name, score in sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
@@ -787,9 +813,12 @@ def get_identify_log():
         "threshold": SCORE_THRESHOLD,
         "people": [{"name": name, "kana": metadata.get(name, {}).get("kana", name)}
                    for name in sorted(profiles)],
+        "min_register_sec": {ENV_BROWSER: MIN_REGISTER_SEC, ENV_DEVICE: MIN_REGISTER_DEVICE_SEC},
         "entries": [{**e,
+                     "env": env_of_source(e["source"]),
                      "has_audio": e["id"] in identify_audio,
-                     "registered_to": identify_audio.get(e["id"], {}).get("registered_to")}
+                     "registered_to": identify_audio.get(e["id"], {}).get("registered_to"),
+                     "dismissed": identify_audio.get(e["id"], {}).get("dismissed", False)}
                     for e in list(identify_log)],
     })
 
@@ -831,124 +860,42 @@ def mark_registered(entry_id: int, name: str):
             logging.error(f"[register] could not save log: {e}")
 
 
-# ---- スタックチャンで話した声を自動で登録する（先に人を選んでおく方式） ----
-ENROLL_MAX_COUNT = 20
-# 自動登録では人が録音を確かめないので、ノイズの多い発話は使わない（スコア画面の ⚠ と同じ基準）
-ENROLL_MIN_SNR_DB = float(os.getenv("SPEAKER_ENROLL_MIN_SNR_DB", "15"))
-ENROLL_MAX_MINUTES = 30
-enroll_session = None  # {"name", "total", "remaining", "expires_at", "added": [...], "skipped": {...}, "errors"}
-enroll_lock = threading.Lock()
+def unassign_entries(entry_ids):
+    """登録を削除したとき、元になった識別ログの録音を「未振り分け」に戻す"""
+    with identify_lock:
+        for entry_id in entry_ids:
+            item = identify_audio.get(entry_id)
+            if entry_id is None or item is None or not item.get("registered_to"):
+                continue
+            item["registered_to"] = None
+            try:
+                _append_log_record({"type": "unregistered", "id": entry_id})
+            except OSError as e:
+                logging.error(f"[unassign] could not save log: {e}")
 
 
-def run_background(fn):
-    """識別の応答を遅らせないよう別スレッドで実行する（テスト中はその場で実行）"""
-    if app.testing:
-        fn()
-    else:
-        threading.Thread(target=fn, daemon=True).start()
+def set_dismissed(entry_id: int, dismissed: bool):
+    with identify_lock:
+        item = identify_audio.get(entry_id)
+        if item is None:
+            abort(404, description="録音が残っていません")
+        item["dismissed"] = dismissed
+        _append_log_record({"type": "dismissed" if dismissed else "undismissed", "id": entry_id})
 
 
-def _active_enroll_session():
-    """有効な登録待ちがあれば返す（enroll_lock を持った状態で呼ぶ）"""
-    sess = enroll_session
-    if sess and sess["remaining"] > 0 and time.time() < sess["expires_at"]:
-        return sess
-    return None
-
-
-def maybe_enroll(entry_id: int, audio: np.ndarray, sr: int, speech_sec: float,
-                 snr_db, source: str):
-    """登録待ちの間にスタックチャンから届いた声を、選ばれた人の登録に加える"""
-    if env_of_source(source) != ENV_DEVICE:
-        return
-    with enroll_lock:
-        sess = _active_enroll_session()
-        if sess is None:
-            return
-        # 「はい」など短い返事や、ノイズの多い発話は使わない（回数にも数えない）
-        if speech_sec < MIN_REGISTER_DEVICE_SEC:
-            sess["skipped"]["short"] += 1
-            return
-        if snr_db is not None and snr_db < ENROLL_MIN_SNR_DB:
-            sess["skipped"]["noisy"] += 1
-            return
-        sess["remaining"] -= 1  # 先に枠を確保しておく（同時に届いた分で数を超えないように）
-
-    def work():
-        body, status = add_sample(sess["name"], "", "add", audio, sr, ENV_DEVICE)
-        with enroll_lock:
-            if status == 200:
-                sess["added"].append({"entry_id": entry_id, "sample_id": body["sample_id"],
-                                      "consistency": body["consistency"],
-                                      "speech_sec": body["speech_sec"]})
-            else:
-                sess["remaining"] += 1
-                sess["errors"].append(body.get("error", str(status)))
-                if status == 404:  # 途中で登録者が削除された
-                    sess["remaining"] = 0
-        if status == 200:
-            mark_registered(entry_id, sess["name"])
-        log(f"[enroll] {sess['name']}: entry {entry_id} -> {status} ({sess['remaining']} left)")
-
-    run_background(work)
-
-
-def enroll_session_view():
-    with enroll_lock:
-        sess = enroll_session
-        if sess is None:
-            return None
-        return {
-            "name": sess["name"],
-            "kana": metadata.get(sess["name"], {}).get("kana", sess["name"]),
-            "total": sess["total"],
-            "done": len(sess["added"]),
-            "remaining": sess["remaining"],
-            "skipped": dict(sess["skipped"]),
-            "errors": sess["errors"][-3:],
-            "added": list(sess["added"]),
-            "active": _active_enroll_session() is not None,
-            "expires_in": max(0, round(sess["expires_at"] - time.time())),
-            "min_sec": MIN_REGISTER_DEVICE_SEC,
-            "min_snr_db": ENROLL_MIN_SNR_DB,
-        }
-
-
-@app.route("/enroll_session", methods=["POST"])
-def start_enroll_session():
-    """次にスタックチャンへ話しかけた count 回分を name の登録に加える（minutes 分で終了）"""
-    global enroll_session
+@app.route("/identify_log/<int:entry_id>/dismiss", methods=["POST"])
+def dismiss_identify_audio(entry_id):
+    """振り分け画面で「使わない」にする（録音は消さず、一覧から外すだけ）"""
     require_auth()
-    body = request.get_json(silent=True) or {}
-    name = str(body.get("name", "")).strip()
-    if name not in samples:
-        return jsonify({"error": f"識別名「{name}」は登録されていません"}), 404
-    try:
-        count = min(max(int(body.get("count", 5)), 1), ENROLL_MAX_COUNT)
-        minutes = min(max(float(body.get("minutes", 5)), 1), ENROLL_MAX_MINUTES)
-    except (TypeError, ValueError):
-        return jsonify({"error": "count と minutes は数値で指定してください"}), 400
-    with enroll_lock:
-        enroll_session = {"name": name, "total": count, "remaining": count,
-                          "expires_at": time.time() + minutes * 60,
-                          "added": [], "skipped": {"short": 0, "noisy": 0}, "errors": []}
-    log(f"[enroll] start: {name} x{count} ({minutes:g} min)")
-    return jsonify({"session": enroll_session_view()})
+    set_dismissed(entry_id, True)
+    return jsonify({"id": entry_id, "dismissed": True})
 
 
-@app.route("/enroll_session", methods=["GET"])
-def get_enroll_session():
+@app.route("/identify_log/<int:entry_id>/dismiss", methods=["DELETE"])
+def undismiss_identify_audio(entry_id):
     require_auth()
-    return jsonify({"session": enroll_session_view()})
-
-
-@app.route("/enroll_session", methods=["DELETE"])
-def stop_enroll_session():
-    require_auth()
-    with enroll_lock:
-        if enroll_session is not None:
-            enroll_session["remaining"] = 0
-    return jsonify({"session": enroll_session_view()})
+    set_dismissed(entry_id, False)
+    return jsonify({"id": entry_id, "dismissed": False})
 
 
 @app.route("/identify_log/<int:entry_id>/register", methods=["POST"])
@@ -966,6 +913,7 @@ def register_from_identify_log(entry_id):
         mode=body.get("mode", "add"),
         audio=audio, sr=sr,
         env=env_of_source(item["source"]),
+        entry_id=entry_id,
     )
     if status == 200:
         mark_registered(entry_id, result["name"])

@@ -12,6 +12,7 @@
     <div class="app-title">話者識別</div>
     <nav class="app-nav">
       <a href="/">登録</a>
+      <a href="/inbox.html">振り分け</a>
       <a href="/test.html">識別テスト</a>
       <a href="/scores.html" aria-current="page">スコア</a>
     </nav>
@@ -79,6 +80,7 @@
 
   <script src="/static/auth.js"></script>
   <script src="/static/score-charts.js"></script>
+  <script src="/static/player.js"></script>
   <script>
     const latestSub = document.getElementById("latestSub");
     let timer;
@@ -111,29 +113,6 @@
       }
       ScoreCharts.renderMultiples(document.getElementById("multiples"), data);
       ScoreCharts.renderTable(document.getElementById("logTable"), data, { renderActions });
-    }
-
-    // ---- 録音の再生 ----
-    let player = null;
-    let playingButton = null;
-
-    function stopPlaying() {
-      if (player) { player.pause(); URL.revokeObjectURL(player.src); }
-      if (playingButton) playingButton.textContent = playingButton.dataset.label;
-      player = null; playingButton = null;
-    }
-
-    async function play(entryId, kind, button) {
-      const same = playingButton && playingButton.dataset.key === `${entryId}-${kind}`;
-      stopPlaying();
-      if (same) return;  // 再生中のボタンをもう一度押したら停止
-      const res = await Auth.authFetch(`/identify_log/${entryId}/audio?kind=${kind}`);
-      if (!res.ok) { alert(`再生できません (HTTP ${res.status})`); return; }
-      player = new Audio(URL.createObjectURL(await res.blob()));
-      playingButton = button;
-      button.textContent = "■ 停止";
-      player.onended = stopPlaying;
-      player.play();
     }
 
     // ---- ノイズ除去した場合のスコアとの比較 ----
@@ -254,18 +233,8 @@
       const box = document.createElement("div");
       box.className = "row-actions";
       for (const [kind, label] of [["raw", "▶ 元"], ["processed", "▶ 処理後"], ["denoised", "▶ 除去後"]]) {
-        const b = document.createElement("button");
-        b.className = "btn btn-small";
-        b.dataset.label = label;
-        b.dataset.key = `${entry.id}-${kind}`;
-        // 自動更新で表が作り直されても、再生中の表示を保つ
-        b.textContent = playingButton && playingButton.dataset.key === b.dataset.key ? "■ 停止" : label;
-        if (playingButton && playingButton.dataset.key === b.dataset.key) playingButton = b;
-        b.onclick = () => {
-          play(entry.id, kind, b);
-          if (kind === "denoised") showDenoiseCompare(entry);
-        };
-        box.appendChild(b);
+        box.appendChild(AudioPlayer.button(entry.id, kind, label,
+          kind === "denoised" ? () => showDenoiseCompare(entry) : null));
       }
       if (entry.registered_to) {
         const done = document.createElement("span");

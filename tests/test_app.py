@@ -442,78 +442,55 @@ class TestEnvironments:
         assert app_module.profiles["alice"].shape[0] == 1
 
 
-class TestEnrollSession:
-    @pytest.fixture(autouse=True)
-    def _reset(self, monkeypatch):
-        monkeypatch.setattr(app_module, "enroll_session", None)
+class TestInbox:
+    """振り分け画面: ためておいた録音を後から聞いて人に振り分ける"""
 
-    def _start(self, client, **body):
-        return client.post("/enroll_session", headers=AUTH, json={"name": "alice", **body})
+    def _speech_entry(self, client):
+        return _identify_entry(client, source="stackchan", wav=_make_speech_wav(3.0, silence_sec=1.0))
 
-    def test_requires_auth_and_existing_person(self, client, isolated_profiles):
-        assert client.post("/enroll_session", json={"name": "alice"}).status_code == 401
-        assert self._start(client).status_code == 404
+    def _entry(self, client, entry_id):
+        entries = client.get("/identify_log", headers=AUTH).get_json()["entries"]
+        return next(e for e in entries if e["id"] == entry_id)
+
+    def test_dismiss_and_undo(self, client, isolated_profiles):
+        entry = self._speech_entry(client)
+        assert self._entry(client, entry["id"])["dismissed"] is False
+        assert client.post(f"/identify_log/{entry['id']}/dismiss").status_code == 401
+        assert client.post(f"/identify_log/{entry['id']}/dismiss", headers=AUTH).status_code == 200
+        assert self._entry(client, entry["id"])["dismissed"] is True
+        app_module.load_identify_log()  # 再起動しても残る
+        assert self._entry(client, entry["id"])["dismissed"] is True
+        client.delete(f"/identify_log/{entry['id']}/dismiss", headers=AUTH)
+        app_module.load_identify_log()
+        assert self._entry(client, entry["id"])["dismissed"] is False
+        assert client.post("/identify_log/999999/dismiss", headers=AUTH).status_code == 404
+
+    def test_entries_have_env(self, client, isolated_profiles):
+        assert self._entry(client, self._speech_entry(client)["id"])["env"] == "device"
+        entry = _identify_entry(client, source="test")
+        assert self._entry(client, entry["id"])["env"] == "browser"
+
+    def test_deleting_sample_returns_recording_to_inbox(self, client, isolated_profiles):
+        """振り分けた登録を削除（取り消し）すると、元の録音が未振り分けに戻る"""
         _register(client, "alice")
-        session = self._start(client, count=3).get_json()["session"]
-        assert session["active"] and session["total"] == 3 and session["remaining"] == 3
+        entry = self._speech_entry(client)
+        sample_id = client.post(f"/identify_log/{entry['id']}/register", headers=AUTH,
+                                json={"name": "alice"}).get_json()["sample_id"]
+        assert self._entry(client, entry["id"])["registered_to"] == "alice"
+        client.delete(f"/profiles/alice/samples/{sample_id}", headers=AUTH)
+        assert self._entry(client, entry["id"])["registered_to"] is None
+        app_module.load_identify_log()  # 再起動しても未振り分けのまま
+        assert self._entry(client, entry["id"])["registered_to"] is None
+        # もう一度振り分けられる
+        assert client.post(f"/identify_log/{entry['id']}/register", headers=AUTH,
+                           json={"name": "alice"}).status_code == 200
 
-    def test_device_utterances_are_added_until_count(self, client, isolated_profiles):
-        """登録待ちの間にスタックチャンから届いた声が、回数分だけ登録に加わる"""
+    def test_deleting_person_returns_recordings_to_inbox(self, client, isolated_profiles):
         _register(client, "alice")
-        self._start(client, count=2)
-        ids = [_identify_entry(client, source="stackchan", wav=_make_speech_wav(3.0, silence_sec=1.0))["id"]
-               for _ in range(3)]
-        session = client.get("/enroll_session", headers=AUTH).get_json()["session"]
-        assert session["done"] == 2 and not session["active"]
-        assert len(app_module.samples["alice"]) == 3          # ブラウザ 1 + スタックチャン 2
-        assert sorted(app_module.sample_envs["alice"].values()) == ["browser", "device", "device"]
-        assert [app_module.identify_audio[i].get("registered_to") for i in ids] == ["alice", "alice", None]
-
-    def test_browser_and_short_utterances_are_not_added(self, client, isolated_profiles):
-        """識別テスト画面からの録音と、短い返事は使わない（短いものは回数にも数えない）"""
-        _register(client, "alice")
-        self._start(client, count=2)
-        _identify_entry(client, source="test")
-        _identify_entry(client, source="stackchan", wav=_make_speech_wav(1.0, silence_sec=1.0))
-        session = client.get("/enroll_session", headers=AUTH).get_json()["session"]
-        _identify_entry(client, source="stackchan", wav=_make_speech_wav(0.3, silence_sec=1.0))
-        session = client.get("/enroll_session", headers=AUTH).get_json()["session"]
-        assert session["done"] == 0 and session["remaining"] == 2
-        assert session["skipped"] == {"short": 2, "noisy": 0}
-        assert len(app_module.samples["alice"]) == 1
-
-    def test_noisy_utterances_are_not_added(self, client, isolated_profiles):
-        """SN 比が低い（ノイズが多い）発話は自動登録に使わない"""
-        import soundfile as sf
-        _register(client, "alice")
-        self._start(client, count=2)
-        rng = np.random.default_rng(0)
-        sr = 16000
-        tone = 0.3 * np.sin(2 * np.pi * 200 * np.arange(3 * sr) / sr)
-        noisy = np.concatenate([np.zeros(sr), tone, np.zeros(sr)]) + 0.1 * rng.standard_normal(5 * sr)
-        buf = io.BytesIO()
-        sf.write(buf, noisy.astype(np.float32), sr, format="WAV")
-        buf.seek(0)
-        entry = _identify_entry(client, source="stackchan", wav=buf)
-        assert entry["snr_db"] < app_module.ENROLL_MIN_SNR_DB
-        session = client.get("/enroll_session", headers=AUTH).get_json()["session"]
-        assert session["skipped"]["noisy"] == 1 and session["done"] == 0
-
-    def test_stop_and_expiry(self, client, isolated_profiles, monkeypatch):
-        _register(client, "alice")
-        # 前提: 登録待ち中なら、この発話は登録に加わる
-        self._start(client, count=1)
-        _identify_entry(client, source="stackchan", wav=_make_speech_wav(3.0, silence_sec=1.0))
-        assert len(app_module.samples["alice"]) == 2
-        self._start(client)
-        assert client.delete("/enroll_session", headers=AUTH).get_json()["session"]["active"] is False
-        _identify_entry(client, source="stackchan", wav=_make_speech_wav(3.0, silence_sec=1.0))
-        assert len(app_module.samples["alice"]) == 2
-        # 期限切れ
-        self._start(client, minutes=1)
-        app_module.enroll_session["expires_at"] = 0
-        _identify_entry(client, source="stackchan", wav=_make_speech_wav(3.0, silence_sec=1.0))
-        assert len(app_module.samples["alice"]) == 2
+        entry = self._speech_entry(client)
+        client.post(f"/identify_log/{entry['id']}/register", headers=AUTH, json={"name": "alice"})
+        client.delete("/profiles/alice", headers=AUTH)
+        assert self._entry(client, entry["id"])["registered_to"] is None
 
 
 # -----------------------------------------------------------------------
@@ -822,6 +799,7 @@ class TestIdentifyLog:
     def test_scores_page_accessible(self, client):
         """GET /scores.html は認証不要でページが返る"""
         assert client.get("/scores.html").status_code == 200
+        assert client.get("/inbox.html").status_code == 200
 
 
 # -----------------------------------------------------------------------

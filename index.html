@@ -11,6 +11,7 @@
     <div class="app-title">話者識別</div>
     <nav class="app-nav">
       <a href="/" aria-current="page">登録</a>
+      <a href="/inbox.html">振り分け</a>
       <a href="/test.html">識別テスト</a>
       <a href="/scores.html">スコア</a>
     </nav>
@@ -65,38 +66,8 @@
     </section>
 
     <section class="card">
-      <h2>スタックチャンと話して登録</h2>
-      <p class="card-sub">スタックチャンのマイクで録った声を登録すると、スタックチャンでの識別の精度が上がります。人を選んで開始したら、あとはスタックチャンにいつもどおり話しかけてください。声が<span id="enrollMinSec">1.5</span>秒以上の発話が自動で登録に加わります（「はい」のような短い返事や、ノイズの多い発話は使いません）。</p>
-      <div id="enrollForm">
-        <div class="field">
-          <label for="enrollPerson">誰の声を登録するか</label>
-          <select id="enrollPerson"></select>
-        </div>
-        <div class="field">
-          <label for="enrollCount">登録する回数</label>
-          <select id="enrollCount">
-            <option value="3">3回</option>
-            <option value="5" selected>5回</option>
-            <option value="10">10回</option>
-          </select>
-        </div>
-        <div class="actions">
-          <button id="enrollStart" class="btn btn-primary">開始（5分間）</button>
-        </div>
-        <p class="hint">開始中は、その人以外がスタックチャンに話しかけないようにしてください。他の人の声が混ざったら、下の一覧から削除できます。</p>
-      </div>
-      <div id="enrollProgress" hidden>
-        <p id="enrollStatus" class="status" role="status"></p>
-        <ul id="enrollAdded" class="enroll-added"></ul>
-        <div class="actions">
-          <button id="enrollStop" class="btn">終了する</button>
-        </div>
-      </div>
-    </section>
-
-    <section class="card">
       <h2>登録済みの話者</h2>
-      <p class="card-sub">一致度は、その録音が同じ人・同じ録音環境の他の録音とどれだけ似ているかです。極端に低い録音（0.5未満）は、雑音や別人の声が入っている可能性があるので削除をおすすめします。スタックチャンのマイクの録音は、スコア画面のログから登録できます。</p>
+      <p class="card-sub">一致度は、その録音が同じ人・同じ録音環境の他の録音とどれだけ似ているかです。極端に低い録音（0.5未満）は、雑音や別人の声が入っている可能性があるので削除をおすすめします。スタックチャンのマイクの録音は、「振り分け」画面で話しかけた録音を聞いて登録できます。</p>
       <div id="profiles" class="empty">読み込み中...</div>
     </section>
   </main>
@@ -121,7 +92,7 @@
 
     // --- 認証（auth.js） ---
     window.onload = function () {
-      Auth.ensureToken(() => { loadProfiles(); pollEnroll(); });
+      Auth.ensureToken(loadProfiles);
     };
 
     // --- 登録のしかた（登録済みの人に追加 / 新しい人を登録） ---
@@ -172,86 +143,7 @@
     }
     document.getElementById("nextTextBtn").onclick = () => showText(textIndex + 1);
 
-    // --- スタックチャンと話して登録（登録待ち） ---
-    const enrollPerson = document.getElementById("enrollPerson");
-    let enrollTimer = null;
-    let enrollLastDone = null;
-
-    function updateEnrollPersonSelect() {
-      const current = enrollPerson.value;
-      enrollPerson.replaceChildren(...people.map((p) => {
-        const opt = document.createElement("option");
-        opt.value = p.name;
-        opt.textContent = `${p.kana}（${p.name}）`;
-        return opt;
-      }));
-      if (people.some((p) => p.name === current)) enrollPerson.value = current;
-      document.getElementById("enrollStart").disabled = people.length === 0;
-    }
-
-    function renderEnroll(session) {
-      const progress = document.getElementById("enrollProgress");
-      const form = document.getElementById("enrollForm");
-      if (!session) { progress.hidden = true; form.hidden = false; return; }
-      document.getElementById("enrollMinSec").textContent = session.min_sec;
-      progress.hidden = false;
-      form.hidden = session.active;
-      document.getElementById("enrollStop").hidden = !session.active;
-      const status = document.getElementById("enrollStatus");
-      const left = `${Math.floor(session.expires_in / 60)}:${String(session.expires_in % 60).padStart(2, "0")}`;
-      status.textContent = session.active
-        ? `● ${session.kana}（${session.name}）の声を待っています: ${session.done} / ${session.total} 件登録・残り ${left}`
-        : `${session.kana}（${session.name}）: ${session.done} 件登録して終了しました`;
-      if (session.skipped.short) status.textContent += `・短すぎて使わなかった発話 ${session.skipped.short} 件`;
-      if (session.skipped.noisy) status.textContent += `・ノイズが多くて使わなかった発話 ${session.skipped.noisy} 件`;
-      status.className = "status" + (session.active ? " is-recording" : " is-ok");
-      document.getElementById("enrollAdded").replaceChildren(...session.added.map((a, i) => {
-        const li = document.createElement("li");
-        const low = a.consistency !== null && a.consistency < 0.5;
-        li.textContent = `${i + 1}件目: 声の長さ ${a.speech_sec}秒・既存の登録との一致度 `
-          + (a.consistency === null ? "–" : a.consistency.toFixed(3)) + (low ? "（低め：別の人の声かもしれません）" : "");
-        if (low) li.className = "low";
-        return li;
-      }), ...session.errors.map((e) => {
-        const li = document.createElement("li");
-        li.className = "low";
-        li.textContent = `登録できなかった発話: ${e}`;
-        return li;
-      }));
-    }
-
-    async function pollEnroll() {
-      const res = await Auth.authFetch("/enroll_session");
-      if (!res.ok) return;
-      const { session } = await res.json();
-      renderEnroll(session);
-      const active = !!(session && session.active);
-      // 登録件数が増えたら一覧に反映する
-      const done = session ? session.done : null;
-      if (enrollLastDone !== null && done !== enrollLastDone) loadProfiles();
-      enrollLastDone = done;
-      clearTimeout(enrollTimer);
-      if (active) enrollTimer = setTimeout(pollEnroll, 2000);
-    }
-
-    document.getElementById("enrollStart").onclick = async () => {
-      const res = await Auth.authFetch("/enroll_session", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: enrollPerson.value, count: Number(document.getElementById("enrollCount").value), minutes: 5 }),
-      });
-      const result = await res.json();
-      if (!res.ok) { alert(result.error || `開始できませんでした (HTTP ${res.status})`); return; }
-      enrollLastDone = 0;
-      pollEnroll();
-    };
-    document.getElementById("enrollStop").onclick = async () => {
-      await Auth.authFetch("/enroll_session", { method: "DELETE" });
-      pollEnroll();
-    };
-
     function updatePersonSelect() {
-      updateEnrollPersonSelect();
       const current = personSelect.value;
       personSelect.replaceChildren(...people.map((p) => {
         const opt = document.createElement("option");

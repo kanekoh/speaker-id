@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>録音の振り分け</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="app-title">話者識別</div>
+    <nav class="app-nav">
+      <a href="/">登録</a>
+      <a href="/inbox.html" aria-current="page">振り分け</a>
+      <a href="/test.html">識別テスト</a>
+      <a href="/scores.html">スコア</a>
+    </nav>
+    <button id="logoutBtn" class="btn btn-ghost btn-small">ログアウト</button>
+  </header>
+
+  <main class="page">
+    <h1>録音の振り分け</h1>
+
+    <section class="card">
+      <h2>スタックチャンに話しかけた録音</h2>
+      <p class="card-sub">録音を聞いて、誰の声かのボタンを押すと、その人の登録に加わります（スタックチャンのマイクの声として登録されるので、スタックチャンでの識別の精度が上がります）。誰の声でもない録音や、複数人の声が混ざった録音は「使わない」にしてください。録音はサーバーに直近の約200件まで保存されます。</p>
+      <div class="actions">
+        <button id="reloadBtn" class="btn">🔄 再読み込み</button>
+        <label class="check"><input type="checkbox" id="showShort"> 短くて登録に使えない録音も表示</label>
+        <label class="check"><input type="checkbox" id="showDone"> 振り分け済み・使わない録音も表示</label>
+        <label class="check"><input type="checkbox" id="showBrowser"> 識別テスト画面（ブラウザ）の録音も表示</label>
+      </div>
+      <p id="summary" class="hint"></p>
+      <ul id="inbox" class="inbox"></ul>
+    </section>
+  </main>
+
+  <div class="modal-backdrop" id="newPersonDialog" hidden>
+    <form class="card modal" role="dialog" aria-modal="true" aria-labelledby="newPersonTitle">
+      <h2 id="newPersonTitle">新しい人として登録</h2>
+      <div class="field">
+        <label for="newName">識別名（半角英数字）</label>
+        <input type="text" id="newName" placeholder="例: tanaka">
+      </div>
+      <div class="field">
+        <label for="newKana">表示名</label>
+        <input type="text" id="newKana" placeholder="例: たなかさん">
+      </div>
+      <p class="status" id="newPersonStatus" role="status"></p>
+      <div class="actions">
+        <button type="button" class="btn" id="newPersonCancel">閉じる</button>
+        <button type="submit" class="btn btn-primary">登録する</button>
+      </div>
+    </form>
+  </div>
+
+  <script src="/static/auth.js"></script>
+  <script src="/static/player.js"></script>
+  <script>
+    let people = [];
+    let minSec = { browser: 3, device: 1.5 };
+    // この画面で振り分けた結果（取り消しできるように、再読み込みまで行を残す）
+    const assigned = new Map();  // entry id -> { name, kana, sample_id, consistency }
+
+    window.onload = function () {
+      Auth.ensureToken(load);
+    };
+    document.getElementById("logoutBtn").onclick = () => Auth.logout();
+    document.getElementById("reloadBtn").onclick = () => { assigned.clear(); load(); };
+    for (const id of ["showShort", "showDone", "showBrowser"]) {
+      document.getElementById(id).onchange = render;
+    }
+
+    let entries = [];
+
+    async function load() {
+      const [logRes, profRes] = await Promise.all([
+        Auth.authFetch("/identify_log"),
+        Auth.authFetch("/profiles"),
+      ]);
+      if (!logRes.ok || !profRes.ok) return;
+      const log = await logRes.json();
+      people = (await profRes.json()).people;
+      minSec = log.min_register_sec;
+      entries = log.entries.filter((e) => e.has_audio).reverse();  // 新しい順
+      render();
+    }
+
+    const kanaOf = (name) => (people.find((p) => p.name === name) || {}).kana || name;
+    const usable = (e) => e.speech_sec != null && e.speech_sec >= minSec[e.env];
+
+    function render() {
+      const showShort = document.getElementById("showShort").checked;
+      const showDone = document.getElementById("showDone").checked;
+      const showBrowser = document.getElementById("showBrowser").checked;
+      const pending = entries.filter((e) => !e.registered_to && !e.dismissed && usable(e) && e.env === "device");
+      document.getElementById("summary").textContent =
+        `未振り分け ${pending.length} 件（スタックチャンの録音で、登録に使える長さのもの）`;
+
+      const visible = entries.filter((e) =>
+        assigned.has(e.id)
+        || ((showBrowser || e.env === "device")
+            && (showShort || usable(e))
+            && (showDone || (!e.registered_to && !e.dismissed))));
+      const list = document.getElementById("inbox");
+      if (visible.length === 0) {
+        const li = document.createElement("li");
+        li.className = "empty";
+        li.textContent = "振り分ける録音はありません。スタックチャンに話しかけると、ここに録音がたまります。";
+        list.replaceChildren(li);
+        return;
+      }
+      list.replaceChildren(...visible.map(renderItem));
+    }
+
+    function describeResult(e) {
+      if (e.reason === "too_short") return "スタックチャンの判定: 声が短すぎて識別せず";
+      if (e.result) return `スタックチャンの判定: ${kanaOf(e.result)}（${e.score.toFixed(2)}）`;
+      if (e.candidate) return `スタックチャンの判定: 該当なし（最も近い ${kanaOf(e.candidate)} ${e.score.toFixed(2)}）`;
+      return "スタックチャンの判定: 該当なし";
+    }
+
+    function renderItem(e) {
+      const li = document.createElement("li");
+      li.className = "inbox-item";
+
+      const head = document.createElement("div");
+      head.className = "inbox-head";
+      const time = document.createElement("strong");
+      time.textContent = e.time.replace("T", " ");
+      const meta = document.createElement("span");
+      meta.className = "hint";
+      const lowSnr = e.snr_db != null && e.snr_db < 15;
+      meta.textContent = ` ${e.env === "device" ? "スタックチャン" : "ブラウザ"}・声 ${e.speech_sec ?? "–"}秒・`
+        + `SN比 ${e.snr_db != null ? e.snr_db.toFixed(0) + "dB" : "–"}${lowSnr ? "（⚠ ノイズ多め）" : ""}・${describeResult(e)}`;
+      head.append(time, meta);
+      li.appendChild(head);
+
+      const row = document.createElement("div");
+      row.className = "inbox-actions";
+      const listen = document.createElement("div");
+      listen.className = "row-actions";
+      listen.append(AudioPlayer.button(e.id, "raw", "▶ 再生"), AudioPlayer.button(e.id, "processed", "▶ 声だけ"));
+      row.appendChild(listen);
+
+      const done = assigned.get(e.id);
+      const choose = document.createElement("div");
+      choose.className = "row-actions";
+      if (done) {
+        const msg = document.createElement("span");
+        msg.className = "status is-ok";
+        msg.textContent = `✓ ${done.kana} に振り分けました`
+          + (done.consistency != null ? `（既存の登録との一致度 ${done.consistency.toFixed(2)}）` : "");
+        choose.append(msg, smallButton("取り消し", () => undoAssign(e, done)));
+      } else if (e.registered_to) {
+        const msg = document.createElement("span");
+        msg.className = "badge";
+        msg.textContent = `振り分け済み: ${kanaOf(e.registered_to)}`;
+        choose.appendChild(msg);
+      } else if (e.dismissed) {
+        const msg = document.createElement("span");
+        msg.className = "badge";
+        msg.textContent = "使わない";
+        choose.append(msg, smallButton("戻す", () => setDismissed(e, false)));
+      } else if (!usable(e)) {
+        const msg = document.createElement("span");
+        msg.className = "hint";
+        msg.textContent = `短すぎて登録に使えません（${minSec[e.env]}秒以上必要）`;
+        choose.appendChild(msg);
+      } else {
+        // スタックチャンが判定した人（なければ最も近い人）を目立たせる
+        const guess = e.result || e.candidate;
+        for (const p of people) {
+          const b = smallButton(p.kana, () => assign(e, p.name, b));
+          if (p.name === guess) b.classList.add("btn-primary");
+          choose.appendChild(b);
+        }
+        choose.append(smallButton("＋ 新しい人…", () => openNewPerson(e)),
+                      smallButton("使わない", () => setDismissed(e, true), "btn-ghost"));
+      }
+      row.appendChild(choose);
+      li.appendChild(row);
+      return li;
+    }
+
+    function smallButton(label, onClick, extra) {
+      const b = document.createElement("button");
+      b.className = `btn btn-small${extra ? " " + extra : ""}`;
+      b.textContent = label;
+      b.onclick = onClick;
+      return b;
+    }
+
+    async function assign(e, name, button, body) {
+      if (button) button.disabled = true;
+      const res = await Auth.authFetch(`/identify_log/${e.id}/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body || { mode: "add", name }),
+      });
+      const result = await res.json();
+      if (!res.ok) {
+        if (button) button.disabled = false;
+        alert(result.error || `振り分けできませんでした (HTTP ${res.status})`);
+        return false;
+      }
+      assigned.set(e.id, { name: result.name, kana: result.kana, sample_id: result.sample_id,
+                           consistency: result.consistency });
+      e.registered_to = result.name;
+      if (body) await load(); else render();  // 新しい人を作ったときはボタンの並びも更新する
+      return true;
+    }
+
+    async function undoAssign(e, done) {
+      const res = await Auth.authFetch(
+        `/profiles/${encodeURIComponent(done.name)}/samples/${encodeURIComponent(done.sample_id)}`,
+        { method: "DELETE" });
+      if (!res.ok) { alert(`取り消せませんでした (HTTP ${res.status})`); return; }
+      assigned.delete(e.id);
+      await load();  // 人の登録がなくなった場合もあるので読み直す
+    }
+
+    async function setDismissed(e, dismissed) {
+      const res = await Auth.authFetch(`/identify_log/${e.id}/dismiss`, { method: dismissed ? "POST" : "DELETE" });
+      if (!res.ok) { alert(`変更できませんでした (HTTP ${res.status})`); return; }
+      e.dismissed = dismissed;
+      render();
+    }
+
+    // ---- 新しい人として登録 ----
+    const dialog = document.getElementById("newPersonDialog");
+    let dialogEntry = null;
+    function openNewPerson(e) {
+      dialogEntry = e;
+      document.getElementById("newName").value = "";
+      document.getElementById("newKana").value = "";
+      document.getElementById("newPersonStatus").textContent = "";
+      dialog.hidden = false;
+      document.getElementById("newName").focus();
+    }
+    document.getElementById("newPersonCancel").onclick = () => { dialog.hidden = true; };
+    dialog.querySelector("form").onsubmit = async (ev) => {
+      ev.preventDefault();
+      const name = document.getElementById("newName").value.trim();
+      const kana = document.getElementById("newKana").value.trim();
+      const ok = await assign(dialogEntry, name, null, { mode: "new", name, kana });
+      if (ok) dialog.hidden = true;
+    };
+  </script>
+</body>
+</html>
